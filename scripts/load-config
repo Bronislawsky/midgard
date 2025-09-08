@@ -1,0 +1,79 @@
+#!/usr/bin/env bash
+# file : ./scripts/load-config
+#------------------------------------------------------------------------------
+#         .__    .___                      .___
+#   _____ |__| __| _/ _________ _______  __| _/
+#  /     \|  |/ __ | / ___\__  \\_  __ \/ __ |
+# |  Y Y  \  / /_/ |/ /_/  > __ \|  | \/ /_/ |
+# |__|_|  /__\____ |\___  (____  /__|  \____ |
+#       \/        \/_____/     \/           \/
+# load-config — validate midgard.conf (assumes it’s already sourced by main)
+#------------------------------------------------------------------------------
+
+# Enforce: only usable when sourced by the main launcher
+if [[ "${MIDGARD_MAIN:-}" != "1" ]]; then
+  echo "This script must be sourced from the midgard launcher." >&2
+  return 1 2>/dev/null || exit 1
+fi
+
+# --- Validate already-loaded config variables ---
+ERRORS=()
+
+status_start "Validating configuration ${MIDGARD_CONFIG_FILE} ..."
+
+REQUIRED_VARS=(
+  RUN_AS_USER
+  RUN_AS_GROUP
+  UMASK
+  MYSQL_BIN
+  RSYNC_BIN
+  RESTIC_BIN
+  FRESHCLAM
+  CLAMDSCAN_BIN
+  WORDFENCE_BIN
+  MALDET_BIN
+  TAR_BIN
+  GPG_BIN
+  FRESHCLAM_UPDATE
+  LOG_RETENTION_DAYS
+  LOG_ROTATE_COPIES
+  VERBOSITY
+  DEFAULT_RETRIES
+  DEFAULT_RETRY_BACKOFF_SECS
+  REPORTING_ENABLE
+  GLOBAL_REPORT_RECIPIENTS
+  SMTP_HOST
+  SMTP_PORT
+  SMTP_USER
+  SMTP_PASS
+  SMTP_FROM
+  SMTP_TLS
+)
+
+for var in "${REQUIRED_VARS[@]}"; do
+  if [[ -z "${!var:-}" ]]; then
+    ERRORS+=("missing $var")
+  fi
+done
+
+# --- Value checks ---
+case "${VERBOSITY:-}" in
+  quiet|normal|verbose) : ;;
+  *) ERRORS+=("erroneous value VERBOSITY='${VERBOSITY:-}' (must be quiet|normal|verbose)") ;;
+esac
+
+case "${SMTP_TLS:-}" in
+  y|n) : ;;
+  *) ERRORS+=("erroneous value SMTP_TLS='${SMTP_TLS:-}' (must be y/n)") ;;
+esac
+
+# --- Report result ---
+if (( ${#ERRORS[@]} > 0 )); then
+  status_fail
+  for e in "${ERRORS[@]}"; do
+    echo "    - $e"
+  done
+  return 1 2>/dev/null || exit 1
+else
+  status_ok
+fi

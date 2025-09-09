@@ -45,4 +45,8 @@ fi
 # Validate config (uses already-loaded variables, dies if invalid)
 source "$(dirname "$0")/scripts/load-config"
 
+# Check binaries + sudo -n (dies on error)
+source "$(dirname "$0")/scripts/binary-check"
+
+
 info "Starting midgard run with verbosity=$VERBOSITY"

@@ -24,19 +24,8 @@ export MIDGARD_MAIN="1"
 # Source helpers (colors, status_* functions, etc.)
 source "$(dirname "$0")/scripts/helper"
 
-# fast-path subcommands that don't need config
-case "${1-}" in
-  encstr)
-    source "$(dirname "$0")/scripts/crypt"
-    midgard_encstr
-    exit 0
-    ;;
-  decstr)
-    source "$(dirname "$0")/scripts/crypt"
-    midgard_decstr
-    exit 0
-    ;;
-esac
+# Source crypt for encrypting / decrypting
+source "$(dirname "$0")/scripts/crypt"
 
 # Load config file
 MIDGARD_CONFIG_FILE="$(dirname "$0")/config/midgard.conf"
@@ -62,5 +51,18 @@ source "$(dirname "$0")/scripts/load-config"
 # Check binaries + sudo -n (dies on error)
 source "$(dirname "$0")/scripts/binary-check"
 
+
+# fast-path subcommands that don't need global config
+case "${1-}" in
+  encstr)
+    midgard_encstr; exit 0 ;;
+  decstr)
+     midgard_decstr; exit 0 ;;
+  create-site)
+    shift
+    source "$(dirname "$0")/scripts/create-site" "$@"
+    exit 0
+    ;;
+esac
 
 info "Starting midgard run with verbosity=$VERBOSITY"

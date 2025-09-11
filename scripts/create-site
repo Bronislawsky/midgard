@@ -334,6 +334,8 @@ HDR
   {
     echo "AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID_v:-}"
     echo "AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY_v:-}"
+    echo "AWS_S3_BUCKET=${AWS_S3_BUCKET_v:-}"
+    echo "AWS_S3_PATH=${AWS_S3_PATH_v:-}"
     echo "AWS_DEFAULT_REGION=${AWS_REGION_v:-}"
   } > "${data_dir}/${site}/aws-credentials"
   chmod 640 "${data_dir}/${site}/aws-credentials"

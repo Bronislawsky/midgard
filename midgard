@@ -54,6 +54,9 @@ source "$(dirname "$0")/scripts/binary-check"
 # Site configuration helper
 source "$(dirname "$0")/scripts/inspect-site"
 
+# Site management helpers (defines site_list/site_enable/site_disable)
+source "$(dirname "$0")/scripts/site"
+
 # fast-path subcommands that don't need global config
 case "${1-}" in
   encstr)
@@ -69,6 +72,20 @@ case "${1-}" in
     shift
     inspect_site_main "$@"
     exit $?
+    ;;
+  site)
+    shift
+    sub="${1-}"; shift || true
+    case "${sub:-}" in
+      list)
+        site_list; exit $? ;;
+      enable)
+        site_enable "${1-}"; exit $? ;;
+      disable)
+        site_disable "${1-}"; exit $? ;;
+      *)
+        echo "Usage: ./midgard site {list|enable <site>|disable <site>}"; exit 1 ;;
+    esac
     ;;
 esac
 

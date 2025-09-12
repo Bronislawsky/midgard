@@ -57,6 +57,10 @@ source "$(dirname "$0")/scripts/inspect-site"
 # Site management helpers (defines site_list/site_enable/site_disable)
 source "$(dirname "$0")/scripts/site"
 
+# Site loader (enabled list + load into assoc arrays)
+source "$(dirname "$0")/scripts/site-load"
+
+
 # fast-path subcommands that don't need global config
 case "${1-}" in
   encstr)
@@ -89,4 +93,36 @@ case "${1-}" in
     ;;
 esac
 
-info "Starting midgard run with verbosity=$VERBOSITY"
+
+# Create a list of enabled websites
+ENABLED_SITES=()
+for f in "$(dirname "$0")/sites-enabled/"*.conf; do
+  # Skip glob if no matches
+  [[ -e "$f" ]] || continue
+  # Ensure it’s really a symlink and points to a file
+  [[ -L "$f" ]] || continue
+  # Strip path + .conf extension → just the site name
+  site="$(basename "$f" .conf)"
+  # Skip the template/example site
+  [[ "$site" == "example.com" ]] && continue
+  ENABLED_SITES+=("$site")
+done
+
+status_start "Inspect all enabled sites (skip-encrypt) ..."
+echo
+for enabled_site in "${ENABLED_SITES[@]}"; do
+  inspect_site_main "$enabled_site" "skip-encrypt" || { status_fail; echo "    - inspection failed for $enabled_site"; exit 1; }
+done;
+
+status_start "Load all enabled sites ..."
+echo
+declare -gA CONFIG_SITES=()   # map site -> array name
+for enabled_site in "${ENABLED_SITES[@]}"; do
+  # Create a legal array name (dots -> underscores)
+  arr="SITE_${enabled_site//./_}"
+  declare -gA "$arr"
+  status_start "  $enabled_site"
+  site_load_into "$enabled_site" "$arr" || { echo "  Failed to load site: $enabled_site"; exit 1; }
+  status_ok
+  CONFIG_SITES["$enabled_site"]="$arr"
+done;

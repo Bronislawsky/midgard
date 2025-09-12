@@ -72,14 +72,13 @@ inspect_site_main() {
 
   local -a ERRORS=()
 
-  status_start "Inspecting site ${site}"; echo
+  status_start " Inspecting site ${site}"; echo
 
   # --- load site conf ---
-  status_start "Reading site config ${conf_file} ..."
+  status_start "   Reading site config ${conf_file} ..."
   if [[ ! -f "$conf_file" ]]; then status_fail; echo "    - site config not found"; return 1; fi
   # shellcheck disable=SC1090
   if ! source "$conf_file"; then status_fail; echo "    - could not source site config"; return 1; fi
-  status_ok
 
   # --- required (presence only) ---
   local REQ=( SITE REMOTE_USER REMOTE_HOST REMOTE_PATH
@@ -94,7 +93,7 @@ inspect_site_main() {
   if (( ${#ERRORS[@]} )); then status_fail; for e in "${ERRORS[@]}"; do echo "    - $e"; done; return 1; else status_ok; fi
 
   # --- files exist ---
-  status_start "Validating sites-data files exist ..."
+  status_start "   Validating sites-data files exist ..."
   local aws="${data_dir}/aws-credentials"
   local mysql="${data_dir}/mysql-credentials"
   local pass="${data_dir}/restic.pass"
@@ -152,12 +151,10 @@ inspect_site_main() {
     _cmp "RESTIC_PASSWORD_FILE content" "${dec_AWS_RESTIC_PASSWORD-}" "${restic_plain-}"
 
     if (( ${#ERRORS[@]} )); then status_fail; for e in "${ERRORS[@]}"; do echo "    - $e"; done; return 1; else status_ok; fi
-  else
-    info "Skipping encryption compare (skip-encrypt)."
   fi
 
   # --- enforce permissions (quiet unless failure) ---
-  status_start "Enforcing permissions for ${site} ..."
+  status_start "   Enforcing permissions for ${site} ..."
   [[ -d "$data_dir" ]] || ERRORS+=("missing ${data_dir}")
   _enforce_perm 600 "$data_dir/restic.pass"
   _enforce_perm 640 "$data_dir/aws-credentials"
@@ -168,7 +165,7 @@ inspect_site_main() {
   if (( ${#ERRORS[@]} )); then
     status_fail; for e in "${ERRORS[@]}"; do echo "    - $e"; done; return 1
   else
-    status_ok; echo "  Permissions for ${site} [OK]"
+    status_ok
     return 0
   fi
 }

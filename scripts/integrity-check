@@ -1,0 +1,125 @@
+#!/usr/bin/env bash
+# file : ./scripts/integrity-check
+#------------------------------------------------------------------------------
+#
+#         .__    .___                      .___
+#   _____ |__| __| _/ _________ _______  __| _/
+#  /     \|  |/ __ | / ___\__  \\_  __ \/ __ |
+# |  Y Y  \  / /_/ |/ /_/  > __ \|  | \/ /_/ |
+# |__|_|  /__\____ |\___  (____  /__|  \____ |
+#       \/        \/_____/     \/           \/
+#
+# integrity-check — enforce owners/perms; ensure logs/reports; prune old runs
+#   - requires MIDGARD_MAIN=1
+#   - expects midgard.conf loaded (RUN_AS_USER/RUN_AS_GROUP/UMASK/LOG_* vars)
+#   - uses status_* helpers from scripts/helper
+#------------------------------------------------------------------------------
+
+[[ "${MIDGARD_MAIN:-}" == "1" ]] || {
+  echo "This script must be sourced from the midgard launcher." >&2
+  return 1 2>/dev/null || exit 1
+}
+
+integrity_check_main() {
+  local script_dir root_dir
+  script_dir="$(cd -- "$(dirname "${BASH_SOURCE[0]}")" &>/dev/null; pwd -P)"
+  root_dir="$(cd -- "${script_dir}/.." &>/dev/null; pwd -P)"
+
+  # sanity: required globals
+  : "${RUN_AS_USER:?RUN_AS_USER not set}"
+  : "${RUN_AS_GROUP:?RUN_AS_GROUP not set}"
+  : "${UMASK:?UMASK not set}"
+  : "${LOG_RETENTION_DAYS:?LOG_RETENTION_DAYS not set}"
+  : "${LOG_ROTATE_COPIES:?LOG_ROTATE_COPIES not set}"
+
+  umask "$UMASK"
+
+  # helper: chown/chmod quietly, complain only on failure
+  _own() { chown -h "${RUN_AS_USER}:${RUN_AS_GROUP}" "$@" 2>/dev/null || return 1; }
+  _mode() { chmod "$1" "${@:2}" 2>/dev/null || return 1; }
+
+  status_start "Integrity check (ownership/permissions) ..."
+  # project dirs we care about
+  local d
+  for d in \
+    "${root_dir}" \
+    "${root_dir}/config" \
+    "${root_dir}/scripts" \
+    "${root_dir}/sites-available" \
+    "${root_dir}/sites-enabled" \
+    "${root_dir}/sites-data"
+  do
+    [[ -d "$d" ]] || continue
+    _own -R "$d" || { status_fail; echo "    - chown failed: $d"; return 1; }
+  done
+  status_ok
+
+  # ensure logs/ and reports/ exist with tight perms
+  status_start "Ensure ./logs and ./reports exist ..."
+  mkdir -p "${root_dir}/logs" "${root_dir}/reports" || { status_fail; echo "    - cannot create logs/reports"; return 1; }
+  _own "${root_dir}/logs" "${root_dir}/reports" || { status_fail; echo "    - chown logs/reports failed"; return 1; }
+  _mode 750 "${root_dir}/logs" "${root_dir}/reports" || { status_fail; echo "    - chmod logs/reports failed"; return 1; }
+  status_ok
+
+  # per-site sensitive files under sites-data/<site>/
+  status_start "Enforce sites-data/<site> file permissions ..."
+  local site_dir f
+  for site_dir in "${root_dir}/sites-data"/*; do
+    [[ -d "$site_dir" ]] || continue
+    _own -R "$site_dir" || { status_fail; echo "    - chown failed: $site_dir"; return 1; }
+
+    # directories 750
+    _mode 750 "$site_dir" || { status_fail; echo "    - chmod dir failed: $site_dir"; return 1; }
+
+    # files (apply if present)
+    [[ -f "$site_dir/id_rsa"          ]] && _mode 600 "$site_dir/id_rsa"          || true
+    [[ -f "$site_dir/id_rsa.pub"      ]] && _mode 644 "$site_dir/id_rsa.pub"      || true
+    [[ -f "$site_dir/restic.pass"     ]] && _mode 600 "$site_dir/restic.pass"     || true
+    [[ -f "$site_dir/aws-credentials" ]] && _mode 640 "$site_dir/aws-credentials" || true
+    [[ -f "$site_dir/mysql-credentials" ]] && _mode 640 "$site_dir/mysql-credentials" || true
+  done
+  status_ok
+
+  # prune logs/reports by EPOCH_TIMESTAMP folder name and LOG_RETENTION_DAYS
+  _prune_timestamped_dir "${root_dir}/logs" "${LOG_RETENTION_DAYS}" "${LOG_ROTATE_COPIES}" "Logs"
+  _prune_timestamped_dir "${root_dir}/reports" "${LOG_RETENTION_DAYS}" "${LOG_ROTATE_COPIES}" "Reports"
+}
+
+# prune helper: args: <base_dir> <retention_days> <keep_count> <label>
+_prune_timestamped_dir() {
+  local base="$1" days="$2" keep="$3" label="$4"
+  local now cutoff
+  now="$(date +%s)"
+  cutoff=$(( now - days*86400 ))
+
+  status_start "Prune ${label} older than ${days}d and cap to ${keep} runs ..."
+  [[ -d "$base" ]] || { status_fail; echo "    - missing $base"; return 1; }
+
+  # collect numeric subdirs (epoch names)
+  mapfile -t ts_dirs < <(find "$base" -mindepth 1 -maxdepth 1 -type d -printf '%f\n' 2>/dev/null | grep -E '^[0-9]+$' | sort -n)
+  # delete older than retention
+  local t dirpath removed=0
+  for t in "${ts_dirs[@]}"; do
+    # guard invalid arithmetic
+    [[ "$t" =~ ^[0-9]+$ ]] || continue
+    if (( t < cutoff )); then
+      dirpath="${base}/${t}"
+      rm -rf -- "$dirpath" 2>/dev/null && ((removed++)) || { status_fail; echo "    - failed to remove $dirpath"; return 1; }
+    fi
+  done
+
+  # refresh list after retention prune and cap to keep N newest
+  mapfile -t ts_dirs < <(find "$base" -mindepth 1 -maxdepth 1 -type d -printf '%f\n' 2>/dev/null | grep -E '^[0-9]+$' | sort -n)
+  local extra=$(( ${#ts_dirs[@]} - keep ))
+  if (( extra > 0 )); then
+    local i
+    for ((i=0; i<extra; i++)); do
+      dirpath="${base}/${ts_dirs[i]}"
+      rm -rf -- "$dirpath" 2>/dev/null || { status_fail; echo "    - failed to remove $dirpath"; return 1; }
+    done
+  fi
+
+  status_ok
+}
+
+# no auto-run; call integrity_check_main from midgard

@@ -13,6 +13,10 @@ cat <<'EOF'
        \/        \/_____/     \/           \/
 
 EOF
+
+EPOCH_TIMESTAMP="$(date +%s)"
+export EPOCH_TIMESTAMP
+
 echo -e " Version : ${MIDGARD_VERSION}\n"
 
 # midgard — main launcher
@@ -50,6 +54,10 @@ source "$(dirname "$0")/scripts/load-config"
 
 # Check binaries + sudo -n (dies on error)
 source "$(dirname "$0")/scripts/binary-check"
+
+# Source integrity check
+source "$(dirname "$0")/scripts/integrity-check"
+integrity_check_main
 
 # Site configuration helper
 source "$(dirname "$0")/scripts/inspect-site"

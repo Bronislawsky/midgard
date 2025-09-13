@@ -68,6 +68,8 @@ source "$(dirname "$0")/scripts/site"
 # Site loader (enabled list + load into assoc arrays)
 source "$(dirname "$0")/scripts/site-load"
 
+# Files retrievale functions
+source "$(dirname "$0")/scripts/pull-rsync"
 
 # fast-path subcommands that don't need global config
 case "${1-}" in
@@ -134,3 +136,13 @@ for enabled_site in "${ENABLED_SITES[@]}"; do
   status_ok
   CONFIG_SITES["$enabled_site"]="$arr"
 done;
+
+# Start Main Backup Loop
+status_start "Pulling files and database content..."
+echo
+for enabled_site in "${ENABLED_SITES[@]}"; do
+  if ! pull_rsync_site "$enabled_site"; then
+    echo "    - rsync pull failed for ${enabled_site}"
+    exit 1
+  fi
+done

@@ -71,6 +71,9 @@ source "$(dirname "$0")/scripts/site-load"
 # Files retrievale functions
 source "$(dirname "$0")/scripts/pull-rsync"
 
+# Database retrievale functions
+source "$(dirname "$0")/scripts/pull-sql"
+
 # fast-path subcommands that don't need global config
 case "${1-}" in
   encstr)
@@ -141,8 +144,16 @@ done;
 status_start "Pulling files and database content..."
 echo
 for enabled_site in "${ENABLED_SITES[@]}"; do
+
   if ! pull_rsync_site "$enabled_site"; then
     echo "    - rsync pull failed for ${enabled_site}"
     exit 1
   fi
+
+  # Database
+  if ! pull_sql_site "$enabled_site"; then
+    echo "    - SQL dump failed for ${enabled_site}"
+    exit 1
+  fi
+
 done

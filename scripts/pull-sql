@@ -1,0 +1,117 @@
+#!/usr/bin/env bash
+# file : ./scripts/pull-sql
+#------------------------------------------------------------------------------
+#
+#         .__    .___                      .___
+#   _____ |__| __| _/ _________ _______  __| _/
+#  /     \|  |/ __ | / ___\__  \\_  __ \/ __ |
+# |  Y Y  \  / /_/ |/ /_/  > __ \|  | \/ /_/ |
+# |__|_|  /__\____ |\___  (____  /__|  \____ |
+#       \/        \/_____/     \/           \/
+#
+# pull-sql — dump remote MySQL/MariaDB and save locally
+#------------------------------------------------------------------------------
+
+[[ "${MIDGARD_MAIN:-}" == "1" ]] || { echo "Must be sourced by midgard"; return 1 2>/dev/null || exit 1; }
+
+# read value from an assoc array given its name
+#_get() { local __a="$1" __k="$2"; eval 'printf "%s" "${'"$__a"'[__k]}"' 2>/dev/null || true; }
+
+_get() {
+  local __arr_name="$1" __key="$2"
+  eval "printf '%s' \"\${$__arr_name[\"$__key\"]-}\""
+}
+
+
+# escape single quotes for safe embedding inside single-quoted strings
+_sq() { printf "%s" "$1" | sed "s/'/'\\\\''/g"; }
+
+pull_sql_site() {
+  local site="${1:-}"; [[ -n "$site" ]] || { echo "pull_sql_site: missing site"; return 1; }
+  local arr="${CONFIG_SITES[$site]:-}"; [[ -n "$arr" ]] || { echo "pull_sql_site: site not loaded: $site"; return 1; }
+
+  # inputs
+  local REMOTE_USER REMOTE_HOST SSH_KEY_PRIV LOCAL_SYNC_PATH LOCAL_SQL_PATH LOCAL_SQL_FILE
+  local DB_USER DB_PASS DB_HOST DB_NAME
+  REMOTE_USER="$(_get "$arr" REMOTE_USER)"
+  REMOTE_HOST="$(_get "$arr" REMOTE_HOST)"
+  SSH_KEY_PRIV="$(_get "$arr" SSH_KEY_PRIV)"
+  LOCAL_SYNC_PATH="$(_get "$arr" LOCAL_SYNC_PATH)"
+  LOCAL_SQL_PATH="$(_get "$arr" LOCAL_SQL_PATH)"
+  LOCAL_SQL_FILE="$(_get "$arr" LOCAL_SQL_FILE)"
+  DB_USER="$(_get "$arr" DB_USER)"
+  DB_PASS="$(_get "$arr" DB_PASS)"
+  DB_HOST="$(_get "$arr" DB_HOST)"
+  DB_NAME="$(_get "$arr" DB_NAME)"
+
+  # log/report
+  local log_dir="logs/${EPOCH_TIMESTAMP}"
+  local rep_dir="reports/${EPOCH_TIMESTAMP}"
+  local site_log="${log_dir}/${site}.log"
+  local site_rep="${rep_dir}/${site}.report"
+  mkdir -p "$log_dir" "$rep_dir"
+
+  # local dump path
+  local local_sql_dir="${LOCAL_SYNC_PATH%/}${LOCAL_SQL_PATH}"
+  mkdir -p "$local_sql_dir"
+  local dest_tmp="${local_sql_dir%/}/${LOCAL_SQL_FILE}.tmp"
+  local dest_sql="${local_sql_dir%/}/${LOCAL_SQL_FILE}"
+
+  # sanity
+  local errs=()
+  [[ -n "$REMOTE_USER" ]] || errs+=("REMOTE_USER missing")
+  [[ -n "$REMOTE_HOST" ]] || errs+=("REMOTE_HOST missing")
+  [[ -n "$SSH_KEY_PRIV" && -r "$SSH_KEY_PRIV" ]] || errs+=("SSH private key not readable: $SSH_KEY_PRIV")
+  [[ -n "$DB_USER" ]] || errs+=("DB_USER missing")
+  [[ -n "$DB_PASS" ]] || errs+=("DB_PASS missing")
+  [[ -n "$DB_HOST" ]] || errs+=("DB_HOST missing")
+  [[ -n "$DB_NAME" ]] || errs+=("DB_NAME missing")
+  if ((${#errs[@]})); then
+    status_fail
+    printf '    - %s\n' "${errs[@]}"
+    echo "SQL=FAIL" >>"$site_rep"
+    return 1
+  fi
+
+  status_start "Dumping database for ${site} ..."
+  echo
+
+  # build ssh
+  local SSH_OPTS=(-i "$SSH_KEY_PRIV" -o BatchMode=yes -o StrictHostKeyChecking=accept-new -o ConnectTimeout=15)
+
+  # we pass creds to remote via: env DBU=… DBP=… DBH=… DBN=… bash -s
+  # values are single-quoted, with inner quotes escaped
+  local DBU SQ_DBU SQ_DBP SQ_DBH SQ_DBN
+  SQ_DBU="$(_sq "$DB_USER")"
+  SQ_DBP="$(_sq "$DB_PASS")"
+  SQ_DBH="$(_sq "$DB_HOST")"
+  SQ_DBN="$(_sq "$DB_NAME")"
+
+  # run (no variable-in-heredoc footguns)
+  if ssh "${SSH_OPTS[@]}" "${REMOTE_USER}@${REMOTE_HOST}" \
+       env DBU="$SQ_DBU" DBP="$SQ_DBP" DBH="$SQ_DBH" DBN="$SQ_DBN" bash -s <<'RMT' \
+        | tee "$dest_tmp" >/dev/null 2>>"$site_log"
+set -euo pipefail
+# pick mysqldump on PATH (works on most hosts)
+MD="$(command -v mysqldump || true)"
+: "${MD:=mysqldump}"
+# keep password out of argv
+MYSQL_PWD="$DBP" "$MD" -u "$DBU" -h "$DBH" \
+  --single-transaction --default-character-set=utf8mb4 --skip-lock-tables "$DBN"
+RMT
+  then
+    mv -f "$dest_tmp" "$dest_sql"
+    chmod 640 "$dest_sql"
+    echo "  SQL dump saved to: $dest_sql" | tee -a "$site_log"
+    status_ok
+    echo "SQL=OK" >> "$site_rep"
+    return 0
+  else
+    rc=$?
+    status_fail
+    echo "    - mysqldump via SSH failed for ${site} (rc=$rc)" | tee -a "$site_log"
+    [[ -f "$dest_tmp" ]] && rm -f "$dest_tmp"
+    echo "SQL=FAIL" >> "$site_rep"
+    return 1
+  fi
+}

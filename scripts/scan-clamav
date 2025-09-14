@@ -1,0 +1,79 @@
+#!/usr/bin/env bash
+# file : ./scripts/scan-clamav
+#------------------------------------------------------------------------------
+#
+#         .__    .___                      .___
+#   _____ |__| __| _/ _________ _______  __| _/
+#  /     \|  |/ __ | / ___\__  \\_  __ \/ __ |
+# |  Y Y  \  / /_/ |/ /_/  > __ \|  | \/ /_/ |
+# |__|_|  /__\____ |\___  (____  /__|  \____ |
+#       \/        \/_____/     \/           \/
+#
+# scan-clamav — run clamdscan on local mirror for a site
+#   - must be sourced by ./midgard (MIDGARD_MAIN=1)
+#   - uses CONFIG_SITES + EPOCH_TIMESTAMP + status_* helpers
+#   - logs to   ./logs/$EPOCH_TIMESTAMP/<site>.log
+#   - appends   ./reports/$EPOCH_TIMESTAMP/<site>.report   with CLAMAV=OK|FAIL
+#   - exit 0 on “no infection”, non-zero on virus found or error
+#------------------------------------------------------------------------------
+
+# Safety guard
+if [[ "${MIDGARD_MAIN:-}" != "1" ]]; then
+  echo "This script must be sourced from the midgard launcher." >&2
+  return 1 2>/dev/null || exit 1
+fi
+
+# Helper: read value from an associative array by name
+# usage: _get <assoc_array_name> <key>
+_get() {
+  local __arr="$1" __key="$2"
+  declare -n __ref="$__arr"        # name reference to the assoc array
+  printf '%s' "${__ref[$__key]-}"  # - avoids set -u blowups if missing
+}
+
+scan_clamav_site() {
+  local site="${1:-}"
+  [[ -n "$site" ]] || { echo "scan_clamav_site: missing site"; return 1; }
+
+  local arr="${CONFIG_SITES[$site]:-}"
+  [[ -n "$arr" ]] || { echo "scan_clamav_site: site not loaded: $site"; return 1; }
+
+  # Vars
+  local LOCAL_SYNC_PATH CLAMAV_ENABLE
+  LOCAL_SYNC_PATH="$(_get "$arr" LOCAL_SYNC_PATH)"
+  CLAMAV_ENABLE="$(_get "$arr" CLAMAV_ENABLE)"
+
+  local log_dir="logs/${EPOCH_TIMESTAMP}"
+  local rep_dir="reports/${EPOCH_TIMESTAMP}"
+  local site_log="${log_dir}/${site}.log"
+  local site_rep="${rep_dir}/${site}.report"
+  mkdir -p "$log_dir" "$rep_dir"
+
+  if [[ "$CLAMAV_ENABLE" != "y" ]]; then
+    echo "  clamdscan ${site} ... [SKIPPED]" | tee -a "$site_log"
+    echo "CLAMAV=SKIPPED" >> "$site_rep"
+    return 0
+  fi
+
+  local scan_root="$LOCAL_SYNC_PATH"
+  if [[ ! -d "$scan_root" ]]; then
+    status_start "  clamdscan ${site} (missing ${scan_root}) ..."
+    status_fail
+    echo "    - scan root not found: ${scan_root}" | tee -a "$site_log"
+    echo "CLAMAV=FAIL" >> "$site_rep"
+    return 1
+  fi
+
+  status_start "  clamdscan ${site} ..."
+  if sudo -n "$CLAMDSCAN_BIN" --fdpass "$scan_root" \
+       >>"$site_log" 2>&1; then
+    status_ok
+    echo "CLAMAV=OK" >> "$site_rep"
+    return 0
+  else
+    status_fail
+    echo "    - clamdscan found issues in ${site}" | tee -a "$site_log"
+    echo "CLAMAV=FAIL" >> "$site_rep"
+    return 1
+  fi
+}

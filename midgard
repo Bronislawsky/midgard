@@ -74,6 +74,10 @@ source "$(dirname "$0")/scripts/pull-rsync"
 # Database retrievale functions
 source "$(dirname "$0")/scripts/pull-sql"
 
+# Clamav & Maldet Scans
+source "$(dirname "$0")/scripts/scan-clamav"
+source "$(dirname "$0")/scripts/scan-maldet"
+
 # fast-path subcommands that don't need global config
 case "${1-}" in
   encstr)
@@ -140,7 +144,7 @@ for enabled_site in "${ENABLED_SITES[@]}"; do
   CONFIG_SITES["$enabled_site"]="$arr"
 done;
 
-# Start Main Backup Loop
+# Start Main Backup Loop (Fetch)
 status_start "Pulling files and database content..."
 echo
 for enabled_site in "${ENABLED_SITES[@]}"; do
@@ -154,6 +158,23 @@ for enabled_site in "${ENABLED_SITES[@]}"; do
   if ! pull_sql_site "$enabled_site"; then
     echo "    - SQL dump failed for ${enabled_site}"
     exit 1
+  fi
+
+done
+
+# Start Inpection loop
+status_start "Websites Inspections"
+echo
+for enabled_site in "${ENABLED_SITES[@]}"; do
+
+  # ClamAV
+  if ! scan_clamav_site "$enabled_site"; then
+    echo "    - clamdscan failed for ${enabled_site}"; exit 1
+  fi
+
+  # Maldet
+  if ! scan_maldet_site "$enabled_site"; then
+    echo "    - maldet scan failed for ${enabled_site}"; exit 1
   fi
 
 done

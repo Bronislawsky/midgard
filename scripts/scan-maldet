@@ -1,0 +1,112 @@
+#!/usr/bin/env bash
+# file : ./scripts/scan-maldet
+#------------------------------------------------------------------------------
+#
+#         .__    .___                      .___
+#   _____ |__| __| _/ _________ _______  __| _/
+#  /     \|  |/ __ | / ___\__  \\_  __ \/ __ |
+# |  Y Y  \  / /_/ |/ /_/  > __ \|  | \/ /_/ |
+# |__|_|  /__\____ |\___  (____  /__|  \____ |
+#       \/        \/_____/     \/           \/
+#
+# scan-maldet — run Linux Malware Detect against a site's local mirror
+#   - must be sourced by ./midgard (MIDGARD_MAIN=1)
+#   - uses CONFIG_SITES + EPOCH_TIMESTAMP + status_* helpers
+#   - logs to   ./logs/$EPOCH_TIMESTAMP/<site>.log
+#   - appends   ./reports/$EPOCH_TIMESTAMP/<site>.report   with MALDET=OK|FAIL|SKIPPED
+#   - exit 0 on “no infection”, 1 on infection or error
+#------------------------------------------------------------------------------
+
+# Safety guard
+if [[ "${MIDGARD_MAIN:-}" != "1" ]]; then
+  echo "This script must be sourced from the midgard launcher." >&2
+  return 1 2>/dev/null || exit 1
+fi
+
+# name-ref getter: _get <assoc_array_name> <key>
+_get() {
+  local __arr="$1" __key="$2"
+  declare -n __ref="$__arr"
+  printf '%s' "${__ref[$__key]-}"
+}
+
+scan_maldet_site() {
+  local site="${1:-}"
+  [[ -n "$site" ]] || { echo "scan_maldet_site: missing site"; return 1; }
+
+  local arr="${CONFIG_SITES[$site]:-}"
+  [[ -n "$arr" ]] || { echo "scan_maldet_site: site not loaded: $site"; return 1; }
+
+  # Pull vars from loaded site map
+  local LOCAL_SYNC_PATH MALDET_ENABLE
+  LOCAL_SYNC_PATH="$(_get "$arr" LOCAL_SYNC_PATH)"
+  MALDET_ENABLE="$(_get "$arr" MALDET_ENABLE)"
+
+  local log_dir="logs/${EPOCH_TIMESTAMP}"
+  local rep_dir="reports/${EPOCH_TIMESTAMP}"
+  local site_log="${log_dir}/${site}.log"
+  local site_rep="${rep_dir}/${site}.report"
+  mkdir -p "$log_dir" "$rep_dir"
+
+  # Respect per-site toggle
+  if [[ "${MALDET_ENABLE}" != "y" ]]; then
+    echo "  maldet ${site} ... [SKIPPED]" | tee -a "$site_log"
+    echo "MALDET=SKIPPED" >> "$site_rep"
+    return 0
+  fi
+
+  # Sanity: scan root exists?
+  local scan_root="${LOCAL_SYNC_PATH%/}"
+  if [[ -z "$scan_root" || ! -d "$scan_root" ]]; then
+    status_start "  maldet ${site} (missing ${scan_root}) ..."
+    status_fail
+    echo "    - scan root not found: ${scan_root}" | tee -a "$site_log"
+    echo "MALDET=FAIL" >> "$site_rep"
+    return 1
+  fi
+
+  status_start "  maldet ${site} ..."
+
+  # Run maldet; capture console output to temp then append to site log
+  local tmp_out rc=0
+  tmp_out="$(mktemp -t maldet.${site}.XXXXXX)"
+  if ! sudo -n "$MALDET_BIN" -a "$scan_root" >"$tmp_out" 2>&1; then
+    rc=$?
+  fi
+  cat "$tmp_out" >>"$site_log"
+
+  # Parse hits from console output (no interactive report)
+  # Primary: "processing scan results for hits: N hits"
+  # Fallback: "malware hits N"
+  local hits=""
+  hits="$(grep -Eo 'processing scan results for hits:[[:space:]]*[0-9]+ hits' "$tmp_out" \
+          | awk '{print $(NF-1)}' | tail -n1 || true)"
+  if [[ -z "$hits" ]]; then
+    hits="$(grep -E 'malware hits[[:space:]]+[0-9]+' "$tmp_out" \
+            | awk '{print $NF}' | tail -n1 || true)"
+  fi
+
+  rm -f "$tmp_out"
+
+  # Decide final status:
+  # - If numeric hits > 0 => FAIL
+  # - Else if rc != 0 and hits unknown => FAIL (engine error)
+  # - Else OK
+  if [[ "$hits" =~ ^[0-9]+$ ]] && (( hits > 0 )); then
+    status_fail
+    echo "    - maldet detected ${hits} hit(s) in ${site}" | tee -a "$site_log"
+    echo "MALDET=FAIL" >> "$site_rep"
+    return 1
+  fi
+
+  if [[ "$rc" -ne 0 && -z "$hits" ]]; then
+    status_fail
+    echo "    - maldet exited with rc=$rc and no hits summary (engine error)" | tee -a "$site_log"
+    echo "MALDET=FAIL" >> "$site_rep"
+    return 1
+  fi
+
+  status_ok
+  echo "MALDET=OK" >> "$site_rep"
+  return 0
+}

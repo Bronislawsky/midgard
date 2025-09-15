@@ -78,6 +78,9 @@ source "$(dirname "$0")/scripts/pull-sql"
 source "$(dirname "$0")/scripts/scan-clamav"
 source "$(dirname "$0")/scripts/scan-maldet"
 
+# Wordfence scan helpers
+source "$(dirname "$0")/scripts/scan-wordfence-malware"
+
 # fast-path subcommands that don't need global config
 case "${1-}" in
   encstr)
@@ -175,6 +178,11 @@ for enabled_site in "${ENABLED_SITES[@]}"; do
   # Maldet
   if ! scan_maldet_site "$enabled_site"; then
     echo "    - maldet scan failed for ${enabled_site}"; exit 1
+  fi
+
+  # Wordfence malware
+  if ! scan_wordfence_malware_site "$enabled_site"; then
+    echo "    - wordfence malware scan failed for ${enabled_site}"; exit 1
   fi
 
 done

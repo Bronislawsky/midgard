@@ -80,6 +80,7 @@ source "$(dirname "$0")/scripts/scan-maldet"
 
 # Wordfence scan helpers
 source "$(dirname "$0")/scripts/scan-wordfence-malware"
+source "$(dirname "$0")/scripts/scan-wordfence-vuln"
 
 # fast-path subcommands that don't need global config
 case "${1-}" in
@@ -183,6 +184,11 @@ for enabled_site in "${ENABLED_SITES[@]}"; do
   # Wordfence malware
   if ! scan_wordfence_malware_site "$enabled_site"; then
     echo "    - wordfence malware scan failed for ${enabled_site}"; exit 1
+  fi
+
+  # Wordfence Vulnerability
+  if ! scan_wordfence_vuln_site "$enabled_site"; then
+    echo "    - wordfence vuln scan failed for ${enabled_site}"; exit 1
   fi
 
 done

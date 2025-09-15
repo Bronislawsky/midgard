@@ -315,6 +315,7 @@ HDR
     echo "WORDFENCE_ENABLE=$(_escape_val "${WORDFENCE_ENABLE_v:-}")"
     echo "WORDFENCE_VULN_ENABLE=$(_escape_val "${WORDFENCE_VULN_ENABLE_v:-}")"
     echo "WORDFENCE_ENABLE_DB=$(_escape_val "${WORDFENCE_ENABLE_DB_v:-}")"
+    echo "WORDFENCE_DB_REMOVE_POST=\"\""
     echo
     echo "# Reporting"
     echo "REPORTING_ENABLE=$(_escape_val "${REPORTING_ENABLE_v:-}")"

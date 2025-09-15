@@ -1,0 +1,184 @@
+#!/usr/bin/env bash
+# scan-wordfence-db — recreate local DB from dump and run Wordfence DB scan
+
+# Guard: must be sourced from midgard
+if [[ "${MIDGARD_MAIN:-}" != "1" ]]; then
+  echo "This script must be sourced from the midgard launcher." >&2
+  return 1 2>/dev/null || exit 1
+fi
+
+# name-ref getter
+_get() {
+  local __arr="$1" __key="$2"
+  declare -n __ref="$__arr"
+  printf '%s' "${__ref[$__key]-}"
+}
+
+scan_wordfence_db_site() {
+  local site="${1:-}"
+  [[ -n "$site" ]] || { echo "scan_wordfence_db_site: missing site"; return 1; }
+
+  # Resolve the site map name
+  local arr="${CONFIG_SITES[$site]:-}"
+  [[ -n "$arr" ]] || { echo "scan_wordfence_db_site: site not loaded: $site"; return 1; }
+
+  # Per-site toggles & values (from sites-data / .conf already loaded)
+  local WORDFENCE_ENABLE_DB DB_USER DB_PASS DB_HOST DB_NAME DB_PREFIX WORDFENCE_DB_REMOVE_POST
+  local LOCAL_SYNC_PATH LOCAL_SQL_PATH LOCAL_SQL_FILE
+  WORDFENCE_ENABLE_DB="$(_get "$arr" WORDFENCE_ENABLE_DB)"
+  DB_USER="$(_get "$arr" DB_USER)"
+  DB_PASS="$(_get "$arr" DB_PASS)"
+  DB_HOST="$(_get "$arr" DB_HOST)"
+  DB_NAME="$(_get "$arr" DB_NAME)"
+  DB_PREFIX="$(_get "$arr" DB_PREFIX)"
+  WORDFENCE_DB_REMOVE_POST="$(_get "$arr" WORDFENCE_DB_REMOVE_POST)"
+  LOCAL_SYNC_PATH="$(_get "$arr" LOCAL_SYNC_PATH)"
+  LOCAL_SQL_PATH="$(_get "$arr" LOCAL_SQL_PATH)"
+  LOCAL_SQL_FILE="$(_get "$arr" LOCAL_SQL_FILE)"
+
+  # Logs/Reports
+  local log_dir="logs/${EPOCH_TIMESTAMP}"
+  local rep_dir="reports/${EPOCH_TIMESTAMP}"
+  local site_log="${log_dir}/${site}.log"
+  local site_rep="${rep_dir}/${site}.report"
+  mkdir -p "$log_dir" "$rep_dir"
+
+  # Respect per-site toggle
+  if [[ "${WORDFENCE_ENABLE_DB}" != "y" ]]; then
+    echo "  wordfence db-scan ${site} ... [SKIPPED]" | tee -a "$site_log"
+    echo "WORDFENCE_DB=SKIPPED" >> "$site_rep"
+    return 0
+  fi
+
+  # Global binaries — do NOT shadow with 'local'!
+  : "${WORDFENCE_BIN:?}" "${MYSQL_BIN:?}"
+
+  # Validate binaries are executable
+  local missing=0
+  [[ -x "$WORDFENCE_BIN" ]] || { echo "    - missing: WORDFENCE_BIN" | tee -a "$site_log"; missing=1; }
+  [[ -x "$MYSQL_BIN"     ]] || { echo "    - missing: MYSQL_BIN"     | tee -a "$site_log"; missing=1; }
+  if (( missing )); then
+    echo "  wordfence db-scan ${site} ... [FAIL]" | tee -a "$site_log"
+    echo "WORDFENCE_DB=FAIL" >> "$site_rep"
+    return 1
+  fi
+
+  # Locate SQL dump
+  local dump_path="${LOCAL_SYNC_PATH%/}${LOCAL_SQL_PATH%/}/${LOCAL_SQL_FILE}"
+  if [[ ! -s "$dump_path" ]]; then
+    echo "  wordfence db-scan ${site} ... [FAIL]" | tee -a "$site_log"
+    echo "    - SQL dump not found or empty: $dump_path" | tee -a "$site_log"
+    echo "WORDFENCE_DB=FAIL" >> "$site_rep"
+    return 1
+  fi
+
+  # Start
+  status_start "  wordfence db-scan ${site} ..."
+  echo >>"$site_log"
+
+  # 1) Recreate DB & user (on localhost) using the REAL creds from the site
+  {
+    echo "-- midgard: drop/create db + user for ${DB_NAME}"
+    echo "DROP DATABASE IF EXISTS \`${DB_NAME}\`;"
+    echo "CREATE DATABASE \`${DB_NAME}\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;"
+    echo "DROP USER IF EXISTS '${DB_USER}'@'localhost';"
+    echo "CREATE USER '${DB_USER}'@'localhost' IDENTIFIED BY '${DB_PASS}';"
+    echo "GRANT ALL PRIVILEGES ON \`${DB_NAME}\`.* TO '${DB_USER}'@'localhost';"
+    echo "FLUSH PRIVILEGES;"
+  } | sudo -n "$MYSQL_BIN" -N -B >>"$site_log" 2>&1 || {
+    status_fail
+    echo "    - mysql bootstrap (create db/user) failed" | tee -a "$site_log"
+    echo "WORDFENCE_DB=FAIL" >> "$site_rep"
+    return 1
+  }
+
+  # 2) Import the dump
+  if ! sudo -n "$MYSQL_BIN" "$DB_NAME" < "$dump_path" >>"$site_log" 2>&1; then
+    status_fail
+    echo "    - mysql import failed: $dump_path" | tee -a "$site_log"
+    echo "WORDFENCE_DB=FAIL" >> "$site_rep"
+    return 1
+  fi
+
+  # 2.5) Optional: prune specific posts before scanning (plus related rows)
+  # WORDFENCE_DB_REMOVE_POST="id id id"
+
+  if [[ -n "${WORDFENCE_DB_REMOVE_POST// }" ]]; then
+    # Build CSV of numeric IDs only
+    local ids_csv="" one
+    for one in $WORDFENCE_DB_REMOVE_POST; do
+      [[ "$one" =~ ^[0-9]+$ ]] || continue
+      ids_csv+="${ids_csv:+,}$one"
+    done
+
+    if [[ -n "$ids_csv" ]]; then
+      echo "  pruning posts before scan (IDs: $ids_csv)" | tee -a "$site_log"
+      {
+        cat <<SQL
+SET FOREIGN_KEY_CHECKS=0;
+DELETE pm FROM \`${DB_PREFIX}postmeta\` pm WHERE pm.post_id IN ($ids_csv);
+DELETE tr FROM \`${DB_PREFIX}term_relationships\` tr WHERE tr.object_id IN ($ids_csv);
+DELETE FROM \`${DB_PREFIX}posts\` WHERE ID IN ($ids_csv);
+SET FOREIGN_KEY_CHECKS=1;
+SQL
+      } | sudo -n "$MYSQL_BIN" "$DB_NAME" >>"$site_log" 2>&1 || {
+        status_fail
+        echo "    - failed to prune posts ($ids_csv) prior to scan" | tee -a "$site_log"
+        echo "WORDFENCE_DB=FAIL" >> "$site_rep"
+        return 1
+      }
+    fi
+  fi
+
+  # 3) Quick connection sanity (with site creds)
+  if ! "$MYSQL_BIN" -h "$DB_HOST" -u"$DB_USER" -p"$DB_PASS" -e "SELECT 1;" "$DB_NAME" >>"$site_log" 2>&1; then
+    status_fail
+    echo "    - mysql connection test failed (host=$DB_HOST db=$DB_NAME user=$DB_USER)" | tee -a "$site_log"
+    echo "WORDFENCE_DB=FAIL" >> "$site_rep"
+    return 1
+  fi
+
+  # 4) Run Wordfence DB scan (quiet/human, accept terms)
+  local tmp_out rc=0
+  tmp_out="$(mktemp -t wfdb.${site}.XXXXXX)"
+
+  if ! "$WORDFENCE_BIN" db-scan \
+        --accept-terms \
+        --quiet \
+        --host "$DB_HOST" \
+        --user "$DB_USER" \
+        --password "$DB_PASS" \
+        --database-name "$DB_NAME" \
+        --prefix "$DB_PREFIX" \
+        >"$tmp_out" 2>&1; then
+    rc=$?
+  fi
+  cat "$tmp_out" >>"$site_log"
+
+  # Strip ANSI color for parsing
+  local stripped
+  stripped="$(sed -E 's/\x1B\[[0-9;]*[A-Za-z]//g' "$tmp_out")"
+
+  # Heuristic: FAIL if we see "suspicious" lines or a numeric findings count > 0
+  if echo "$stripped" | grep -qiE 'suspicious|malicious|infection|compromised|matches? found|findings?'; then
+    status_fail
+    echo "    - wordfence db-scan reported suspicious content" | tee -a "$site_log"
+    echo "WORDFENCE_DB=FAIL" >> "$site_rep"
+    rm -f "$tmp_out"
+    return 1
+  fi
+
+  # Also treat non-zero exit as FAIL
+  if (( rc != 0 )); then
+    status_fail
+    echo "    - wordfence db-scan exited with rc=$rc" | tee -a "$site_log"
+    echo "WORDFENCE_DB=FAIL" >> "$site_rep"
+    rm -f "$tmp_out"
+    return 1
+  fi
+
+  status_ok
+  echo "WORDFENCE_DB=OK" >> "$site_rep"
+  rm -f "$tmp_out"
+  return 0
+}

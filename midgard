@@ -83,6 +83,10 @@ source "$(dirname "$0")/scripts/scan-wordfence-malware"
 source "$(dirname "$0")/scripts/scan-wordfence-vuln"
 source "$(dirname "$0")/scripts/scan-wordfence-db"
 
+# Amazon S3 Restic Sync
+source "$(dirname "$0")/scripts/restic-sync"
+
+
 # fast-path subcommands that don't need global config
 case "${1-}" in
   encstr)
@@ -153,7 +157,7 @@ done;
 status_start "Pulling files and database content..."
 echo
 for enabled_site in "${ENABLED_SITES[@]}"; do
-
+echo 'A'
   if ! pull_rsync_site "$enabled_site"; then
     echo "    - rsync pull failed for ${enabled_site}"
     exit 1
@@ -195,6 +199,11 @@ for enabled_site in "${ENABLED_SITES[@]}"; do
   # Wordfence DB scan
   if ! scan_wordfence_db_site "$enabled_site"; then
     echo "    - wordfence db scan failed for ${enabled_site}"; exit 1
+  fi
+
+  # Restic Sync
+  if ! restic_sync_site "$enabled_site"; then
+    echo "    - restic sync failed for ${enabled_site}"; exit 1
   fi
 
 done

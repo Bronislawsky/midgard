@@ -57,6 +57,10 @@ restic_sync_site() {
   status_start "Restic sync for ${site} …"
   echo
 
+  # reset any leaked env from previous sites
+  unset RESTIC_REPOSITORY RESTIC_PASSWORD RESTIC_PASSWORD_FILE
+  unset AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_DEFAULT_REGION
+
   [[ -n "$site" ]] || { info "[restic] missing site argument"; [[ -n "${rep_site:-}" ]] && echo "RESTIC=FAIL" >>"$rep_site"; status_fail; return 2; }
 
   # resolve per-site array

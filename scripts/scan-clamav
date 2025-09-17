@@ -65,7 +65,7 @@ scan_clamav_site() {
   fi
 
   status_start "  clamdscan ${site} ..."
-  if sudo -n "$CLAMDSCAN_BIN" --fdpass "$scan_root" \
+  if sudo -n "$CLAMDSCAN_BIN" --multiscan --fdpass "$scan_root" \
        >>"$site_log" 2>&1; then
     status_ok
     echo "CLAMAV=OK" >> "$site_rep"

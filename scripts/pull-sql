@@ -14,16 +14,12 @@
 
 [[ "${MIDGARD_MAIN:-}" == "1" ]] || { echo "Must be sourced by midgard"; return 1 2>/dev/null || exit 1; }
 
-# read value from an assoc array given its name
-#_get() { local __a="$1" __k="$2"; eval 'printf "%s" "${'"$__a"'[__k]}"' 2>/dev/null || true; }
-
 _get() {
   local __arr_name="$1" __key="$2"
   eval "printf '%s' \"\${$__arr_name[\"$__key\"]-}\""
 }
 
-
-# escape single quotes for safe embedding inside single-quoted strings
+# kept for compatibility (no longer needed in this flow)
 _sq() { printf "%s" "$1" | sed "s/'/'\\\\''/g"; }
 
 pull_sql_site() {
@@ -76,35 +72,61 @@ pull_sql_site() {
   status_start "Dumping database for ${site} ..."
   echo
 
-  # build ssh
+  # ssh/scp opts
   local SSH_OPTS=(-i "$SSH_KEY_PRIV" -o BatchMode=yes -o StrictHostKeyChecking=accept-new -o ConnectTimeout=15)
+  local SCP_OPTS=(-i "$SSH_KEY_PRIV" -o BatchMode=yes -o StrictHostKeyChecking=accept-new -o ConnectTimeout=15 -q)
 
-  # we pass creds to remote via: env DBU=… DBP=… DBH=… DBN=… bash -s
-  # values are single-quoted, with inner quotes escaped
-  local DBU SQ_DBU SQ_DBP SQ_DBH SQ_DBN
-  SQ_DBU="$(_sq "$DB_USER")"
-  SQ_DBP="$(_sq "$DB_PASS")"
-  SQ_DBH="$(_sq "$DB_HOST")"
-  SQ_DBN="$(_sq "$DB_NAME")"
+  # 1) ensure remote tmp dir
+  local remote_tmp_dir
+  if ! remote_tmp_dir="$(
+    ssh -T "${SSH_OPTS[@]}" "${REMOTE_USER}@${REMOTE_HOST}" \
+      'mkdir -p "$HOME/.tmp-backup" && chmod 700 "$HOME/.tmp-backup" && printf "%s" "$HOME/.tmp-backup"' \
+      </dev/null 2>>"$site_log"
+  )"; then
+    status_fail
+    echo "    - cannot create/access remote tmp dir (~/.tmp-backup)" | tee -a "$site_log"
+    echo "SQL=FAIL" >> "$site_rep"
+    return 1
+  fi
 
-  # run (no variable-in-heredoc footguns)
-  if ssh "${SSH_OPTS[@]}" "${REMOTE_USER}@${REMOTE_HOST}" \
-       env DBU="$SQ_DBU" DBP="$SQ_DBP" DBH="$SQ_DBH" DBN="$SQ_DBN" bash -s <<'RMT' \
+  # 2) create local temp .my.cnf and upload securely
+  umask 077
+  local local_mycnf; local_mycnf="$(mktemp "/tmp/.my.cnf-${site}.XXXXXX")" || {
+    status_fail; echo "    - mktemp failed locally" | tee -a "$site_log"; echo "SQL=FAIL" >> "$site_rep"; return 1; }
+  {
+    printf "[client]\n"
+    printf "user=%s\n"     "%s" "$DB_USER"
+    printf "password=%s\n" "%s" "$DB_PASS"
+    printf "host=%s\n"     "%s" "$DB_HOST"
+  } 1> "$local_mycnf"
+
+  chmod 600 "$local_mycnf" 2>>"$site_log" || true
+
+  local ts; ts="$(date +%Y%m%d-%H%M%S)"
+  local remote_mycnf="${remote_tmp_dir}/.my.cnf-${ts}-$$"
+
+  if ! scp "${SCP_OPTS[@]}" -- "$local_mycnf" "${REMOTE_USER}@${REMOTE_HOST}:${remote_mycnf}" 2>>"$site_log"; then
+    rm -f "$local_mycnf"
+    status_fail
+    echo "    - failed to upload remote .my.cnf" | tee -a "$site_log"
+    echo "SQL=FAIL" >> "$site_rep"
+    return 1
+  fi
+  rm -f "$local_mycnf" 2>/dev/null || true
+
+  # 3) run mysqldump on remote using --defaults-extra-file, stream to local tmp
+  #    nothing sensitive in argv beyond the path to the temp file
+  if ssh -T "${SSH_OPTS[@]}" "${REMOTE_USER}@${REMOTE_HOST}" \
+       "MD=\$(command -v mysqldump || true); : \${MD:=mysqldump}; \"\$MD\" --defaults-extra-file=$(printf %q "$remote_mycnf") --single-transaction --default-character-set=utf8mb4 --skip-lock-tables $(printf %q "$DB_NAME")" \
         | tee "$dest_tmp" >/dev/null 2>>"$site_log"
-set -euo pipefail
-# pick mysqldump on PATH (works on most hosts)
-MD="$(command -v mysqldump || true)"
-: "${MD:=mysqldump}"
-# keep password out of argv
-MYSQL_PWD="$DBP" "$MD" -u "$DBU" -h "$DBH" \
-  --single-transaction --default-character-set=utf8mb4 --skip-lock-tables "$DBN"
-RMT
   then
     mv -f "$dest_tmp" "$dest_sql"
     chmod 640 "$dest_sql"
     echo "  SQL dump saved to: $dest_sql" | tee -a "$site_log"
     status_ok
     echo "SQL=OK" >> "$site_rep"
+    # 4) cleanup remote temp file (leave dir for reuse)
+    ssh -T "${SSH_OPTS[@]}" "${REMOTE_USER}@${REMOTE_HOST}" "rm -f -- $(printf %q "$remote_mycnf")" </dev/null 2>>"$site_log" || true
     return 0
   else
     rc=$?
@@ -112,6 +134,8 @@ RMT
     echo "    - mysqldump via SSH failed for ${site} (rc=$rc)" | tee -a "$site_log"
     [[ -f "$dest_tmp" ]] && rm -f "$dest_tmp"
     echo "SQL=FAIL" >> "$site_rep"
+    # attempt cleanup even on failure
+    ssh -T "${SSH_OPTS[@]}" "${REMOTE_USER}@${REMOTE_HOST}" "rm -f -- $(printf %q "$remote_mycnf")" </dev/null 2>>"$site_log" || true
     return 1
   fi
 }

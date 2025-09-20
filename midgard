@@ -150,7 +150,7 @@ echo
 declare -gA CONFIG_SITES=()   # map site -> array name
 for enabled_site in "${ENABLED_SITES[@]}"; do
   # Create a legal array name (dots -> underscores)
-  arr="SITE_${enabled_site//./_}"
+  arr="SITE_${enabled_site//[^A-Za-z0-9_]/_}"
   declare -gA "$arr"
   status_start "  $enabled_site"
   site_load_into "$enabled_site" "$arr" || { echo "  Failed to load site: $enabled_site"; exit 1; }

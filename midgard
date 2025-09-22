@@ -108,6 +108,11 @@ case "${1-}" in
     inspect_site_main "$@"
     exit $?
     ;;
+  aws-policy)
+    shift
+    source "$(dirname "$0")/scripts/aws-policy"
+    aws_policy_cmd "$@"
+    exit $? ;;
   site)
     shift
     sub="${1-}"; shift || true
@@ -150,6 +155,7 @@ echo
 declare -gA CONFIG_SITES=()   # map site -> array name
 for enabled_site in "${ENABLED_SITES[@]}"; do
   # Create a legal array name (dots -> underscores)
+  #arr="SITE_${enabled_site//./_}"
   arr="SITE_${enabled_site//[^A-Za-z0-9_]/_}"
   declare -gA "$arr"
   status_start "  $enabled_site"
@@ -165,13 +171,13 @@ for enabled_site in "${ENABLED_SITES[@]}"; do
 
   if ! pull_rsync_site "$enabled_site"; then
     echo "    - rsync pull failed for ${enabled_site}"
-    exit 1
+    #exit 1
   fi
 
   # Database
   if ! pull_sql_site "$enabled_site"; then
     echo "    - SQL dump failed for ${enabled_site}"
-    exit 1
+    #exit 1
   fi
 echo ''
 done
@@ -183,42 +189,50 @@ for enabled_site in "${ENABLED_SITES[@]}"; do
 
   # ClamAV
   if ! scan_clamav_site "$enabled_site"; then
-    echo "    - clamdscan failed for ${enabled_site}"; exit 1
+    echo "    - clamdscan failed for ${enabled_site}";
+    #exit 1
   fi
 
   # Maldet
   if ! scan_maldet_site "$enabled_site"; then
-    echo "    - maldet scan failed for ${enabled_site}"; exit 1
+    echo "    - maldet scan failed for ${enabled_site}";
+    #exit 1
   fi
 
   # Wordfence malware
   if ! scan_wordfence_malware_site "$enabled_site"; then
-    echo "    - wordfence malware scan failed for ${enabled_site}"; exit 1
+    echo "    - wordfence malware scan failed for ${enabled_site}";
+    #exit 1
   fi
 
   # Wordfence Vulnerability
   if ! scan_wordfence_vuln_site "$enabled_site"; then
-    echo "    - wordfence vuln scan failed for ${enabled_site}"; exit 1
+    echo "    - wordfence vuln scan failed for ${enabled_site}";
+    #exit 1
   fi
 
   # Wordfence DB scan
   if ! scan_wordfence_db_site "$enabled_site"; then
-    echo "    - wordfence db scan failed for ${enabled_site}"; exit 1
+    echo "    - wordfence db scan failed for ${enabled_site}";
+    #exit 1
   fi
 
   # Restic Sync
   if ! restic_sync_site "$enabled_site"; then
-    echo "    - restic sync failed for ${enabled_site}"; exit 1
+    echo "    - restic sync failed for ${enabled_site}";
+    #exit 1
   fi
 
   # Generate report Site
   if ! report_generate_site "$enabled_site"; then
-    echo "    - fail to generate report for ${enabled_site}"; exit 1
+    echo "    - fail to generate report for ${enabled_site}";
+    #exit 1
   fi
 
   # Send report (per-site rules)
   if ! sendmail_site_report "$enabled_site"; then
-    echo "    - fail to send report email for ${enabled_site}"; exit 1
+    echo "    - fail to send report email for ${enabled_site}";
+    #exit 1
   fi
 
 done

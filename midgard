@@ -88,6 +88,9 @@ source "$(dirname "$0")/scripts/restic-sync"
 # Report Generation
 source "$(dirname "$0")/scripts/report"
 
+# Global Reporting
+source "$(dirname "$0")/scripts/report-global"
+
 # Per site mail sending helper
 source "$(dirname "$0")/scripts/sendmail-site"
 
@@ -236,3 +239,7 @@ for enabled_site in "${ENABLED_SITES[@]}"; do
   fi
 
 done
+
+# generate and send global report
+report_generate_global "$EPOCH_TIMESTAMP" || echo "  - global report generation failed"
+send_global_report "$EPOCH_TIMESTAMP" || echo "  - global report send failed"

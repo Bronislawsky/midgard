@@ -94,6 +94,7 @@ site_load_into() { # $1=site  $2=array_name
   eval "${arr_name}[WORDFENCE_ENABLE]=\"${WORDFENCE_ENABLE:-}\""
   eval "${arr_name}[WORDFENCE_VULN_ENABLE]=\"${WORDFENCE_VULN_ENABLE:-}\""
   eval "${arr_name}[WORDFENCE_ENABLE_DB]=\"${WORDFENCE_ENABLE_DB:-}\""
+  eval "${arr_name}[WORDFENCE_DB_REMOVE_POST]=\"${WORDFENCE_DB_REMOVE_POST:-}\""
   eval "${arr_name}[REPORTING_ENABLE]=\"${REPORTING_ENABLE:-}\""
   eval "${arr_name}[REPORTING_EMAILS]=\"${REPORTING_EMAILS:-}\""
 

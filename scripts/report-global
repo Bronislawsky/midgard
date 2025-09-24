@@ -1,7 +1,17 @@
 #!/usr/bin/env bash
 # file: ./scripts/report-global
+#------------------------------------------------------------------------------
+#
+#         .__    .___                      .___
+#   _____ |__| __| _/ _________ _______  __| _/
+#  /     \|  |/ __ | / ___\__  \\_  __ \/ __ |
+# |  Y Y  \  / /_/ |/ /_/  > __ \|  | \/ /_/ |
+# |__|_|  /__\____ |\___  (____  /__|  \____ |
+#       \/        \/_____/     \/           \/
+#
 # Generate a single global report (HTML + optional PDF) and optionally email it.
 # Must be sourced from midgard (MIDGARD_MAIN=1) after scripts/report has been sourced.
+#------------------------------------------------------------------------------
 
 if [[ "${MIDGARD_MAIN:-}" != "1" ]]; then
   echo "This script must be sourced from the midgard launcher." >&2
@@ -281,6 +291,7 @@ mail_from = os.environ.get("SMTP_FROM","no-reply-midgard@example.com")
 use_tls = os.environ.get("SMTP_TLS","y").lower().startswith("y")
 
 raw_rcpts = os.environ.get("REPORTING_EMAILS","")
+# accept comma and/or space separated list
 rcpts = [t for t in raw_rcpts.replace(",", " ").split() if t]
 if not rcpts:
     raise SystemExit("No recipients")
@@ -291,6 +302,7 @@ html = os.environ.get("HTML_PATH","")
 
 msg = EmailMessage()
 msg["From"] = mail_from
+# human-friendly header, doesn't control envelope recipients
 msg["To"] = ", ".join(rcpts)
 msg["Subject"] = subject
 
@@ -309,6 +321,7 @@ elif html and os.path.isfile(html):
 else:
     raise SystemExit("No attachment found")
 
+# send using explicit envelope recipients so all addresses are delivered
 if use_tls:
     with smtplib.SMTP(host, port, timeout=30) as s:
         s.ehlo()
@@ -316,13 +329,13 @@ if use_tls:
         s.ehlo()
         if user and pw:
             s.login(user, pw)
-        s.send_message(msg)
+        s.send_message(msg, to_addrs=rcpts)
 else:
     with smtplib.SMTP(host, port, timeout=30) as s:
         s.ehlo()
         if user and pw:
             s.login(user, pw)
-        s.send_message(msg)
+        s.send_message(msg, to_addrs=rcpts)
 PY
   then
     echo "send_global_report: mailer executed (check ${mail_log} for SMTP output)."

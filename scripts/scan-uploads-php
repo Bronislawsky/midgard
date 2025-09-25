@@ -1,0 +1,154 @@
+#!/usr/bin/env bash
+# file : ./scripts/scan-uploads-php
+#------------------------------------------------------------------------------
+#
+#         .__    .___                      .___
+#   _____ |__| __| _/ _________ _______  __| _/
+#  /     \|  |/ __ | / ___\__  \\_  __ \/ __ |
+# |  Y Y  \  / /_/ |/ /_/  > __ \|  | \/ /_/ |
+# |__|_|  /__\____ |\___  (____  /__|  \____ |
+#       \/        \/_____/     \/           \/
+#
+# scan-uploads-php — scan a site's mirror uploads/ dir for any PHP-like files
+#   - must be sourced by ./midgard (MIDGARD_MAIN=1)
+#   - uses CONFIG_SITES + EPOCH_TIMESTAMP + status_* helpers
+#   - logs to   ./logs/$EPOCH_TIMESTAMP/<site>.log
+#   - appends   ./reports/$EPOCH_TIMESTAMP/<site>.report   with UPLOADS_PHP=OK|FAIL|SKIPPED
+#   - exit 0 on “no suspicious files” or SKIPPED, 1 on findings/error
+#------------------------------------------------------------------------------
+
+# Safety guard
+if [[ "${MIDGARD_MAIN:-}" != "1" ]]; then
+  echo "This script must be sourced from the midgard launcher." >&2
+  exit 1
+fi
+
+# name-ref getter: _get <assoc_array_name> <key>
+_get() {
+  local __arr="$1" __key="$2"
+  declare -n __ref="$__arr"
+  printf '%s' "${__ref[$__key]-}"
+}
+
+scan_uploads_php_site() {
+  local site="${1:-}"
+  [[ -n "$site" ]] || { echo "scan_uploads_php_site: missing site"; return 1; }
+
+  local arr="${CONFIG_SITES[$site]:-}"
+  [[ -n "$arr" ]] || { echo "scan_uploads_php_site: site not loaded: $site"; return 1; }
+
+  # Pull vars from loaded site map
+  local LOCAL_SYNC_PATH LOCAL_DOCUMENT_ROOT WP_CONTENT_DIR \
+        UPLOADS_PHP_ENABLE SITE_SCAN_UPLOADS_PHP
+  LOCAL_SYNC_PATH="$(_get "$arr" LOCAL_SYNC_PATH)"
+  LOCAL_DOCUMENT_ROOT="$(_get "$arr" LOCAL_DOCUMENT_ROOT)"
+  WP_CONTENT_DIR="$(_get "$arr" WP_CONTENT_DIR)"               # optional, defaults to wp-content
+  UPLOADS_PHP_ENABLE="$(_get "$arr" UPLOADS_PHP_ENABLE)"       # preferred toggle
+  SITE_SCAN_UPLOADS_PHP="$(_get "$arr" SITE_SCAN_UPLOADS_PHP)" # backward-compat toggle
+
+  local log_dir="logs/${EPOCH_TIMESTAMP}"
+  local rep_dir="reports/${EPOCH_TIMESTAMP}"
+  local site_log="${log_dir}/${site}.log"
+  local site_rep="${rep_dir}/${site}.report"
+  mkdir -p "$log_dir" "$rep_dir"
+
+  # Respect per-site toggle (either new or legacy flag)
+  if [[ "${UPLOADS_PHP_ENABLE:-}" != "y" && "${SITE_SCAN_UPLOADS_PHP:-}" != "y" ]]; then
+    echo "  uploads-php ${site} ... [SKIPPED]" | tee -a "$site_log"
+    echo "UPLOADS_PHP=SKIPPED" >> "$site_rep"
+    return 0
+  fi
+
+  # Resolve mirror docroot
+  local docroot
+  if [[ -z "${LOCAL_SYNC_PATH:-}" || -z "${LOCAL_DOCUMENT_ROOT:-}" ]]; then
+    status_start "  uploads-php ${site} ..."
+    status_fail
+    echo "    - LOCAL_SYNC_PATH or LOCAL_DOCUMENT_ROOT not set" | tee -a "$site_log"
+    echo "UPLOADS_PHP=FAIL" >> "$site_rep"
+    return 1
+  fi
+  # Normalize join
+  [[ "${LOCAL_DOCUMENT_ROOT}" != /* ]] && LOCAL_DOCUMENT_ROOT="/${LOCAL_DOCUMENT_ROOT}"
+  docroot="${LOCAL_SYNC_PATH%/}${LOCAL_DOCUMENT_ROOT}"
+
+  if [[ ! -d "$docroot" ]]; then
+    status_start "  uploads-php ${site} (missing ${docroot}) ..."
+    status_fail
+    echo "    - scan root not found: ${docroot}" | tee -a "$site_log"
+    echo "UPLOADS_PHP=FAIL" >> "$site_rep"
+    return 1
+  fi
+
+  # Resolve uploads path (honor WP_CONTENT_DIR if present)
+  local wpc="${WP_CONTENT_DIR:-wp-content}"
+  # strip any leading slash from wpc
+  wpc="${wpc#/}"
+  local uploads_path="${docroot%/}/${wpc}/uploads"
+
+  # If uploads path missing, treat as SKIPPED (nothing to scan)
+  if [[ ! -d "$uploads_path" ]]; then
+    echo "  uploads-php ${site} ... [SKIPPED]" | tee -a "$site_log"
+    {
+      echo "== $(date -u +'%FT%TZ') :: UPLOADS PHP SCAN SKIPPED :: ${site} =="
+      echo "DOCROOT : ${docroot}"
+      echo "UPLOADS : ${uploads_path} (not found)"
+    } >> "$site_log"
+    echo "UPLOADS_PHP=SKIPPED" >> "$site_rep"
+    return 0
+  fi
+
+  status_start "  uploads-php ${site} ..."
+
+  {
+    echo "== $(date -u +'%FT%TZ') :: UPLOADS PHP SCAN START :: ${site} =="
+    echo "DOCROOT : ${docroot}"
+    echo "UPLOADS : ${uploads_path}"
+  } >> "$site_log"
+
+  # Perform scan (quiet on console; details go to log only)
+  # Consider common PHP-like extensions abused in uploads
+  local tmp_out rc=0
+  tmp_out="$(mktemp -t uploads.php.${site}.XXXXXX)"
+
+  if ! find "$uploads_path" -type f \( \
+          -iname '*.php'  -o -iname '*.phtml' -o \
+          -iname '*.php5' -o -iname '*.php7'  -o -iname '*.php8' \
+        \) -print > "$tmp_out" 2>&1; then
+    rc=$?
+  fi
+
+  # Append findings to the site log
+  {
+    echo "-- FINDINGS --"
+    cat "$tmp_out"
+    echo "-- END FINDINGS --"
+  } >> "$site_log"
+
+  # Count hits (non-empty lines that are real paths)
+  local hits="0"
+  if grep -qE '^/' "$tmp_out"; then
+    hits="$(grep -E '^/' "$tmp_out" | wc -l | tr -d ' ')"
+  fi
+
+  if [[ "$rc" -ne 0 ]]; then
+    rm -f "$tmp_out"
+    status_fail
+    echo "    - find exited with rc=$rc" | tee -a "$site_log"
+    echo "UPLOADS_PHP=FAIL" >> "$site_rep"
+    return 1
+  fi
+
+  if [[ "${hits:-0}" -gt 0 ]]; then
+    rm -f "$tmp_out"
+    status_fail
+    echo "    - ${hits} PHP-like file(s) found under uploads" | tee -a "$site_log"
+    echo "UPLOADS_PHP=FAIL" >> "$site_rep"
+    return 1
+  fi
+
+  rm -f "$tmp_out"
+  status_ok
+  echo "UPLOADS_PHP=OK" >> "$site_rep"
+  return 0
+}

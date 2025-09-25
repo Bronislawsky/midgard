@@ -35,6 +35,7 @@ if [[ -z "${_report_items[*]-}" ]]; then
     "Wordfence Malware Scan|WORDFENCE_MALWARE"
     "Wordfence Vulnerabilities Scan|WORDFENCE_VULN"
     "Wordfence Database Scan|WORDFENCE_DB"
+    "Scan Uploads for PHP|UPLOADS_PHP"
     "Restic Backup Sync|RESTIC"
   )
 fi

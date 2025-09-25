@@ -127,6 +127,7 @@ create_site_main() {
     old[WORDFENCE_ENABLE]="${WORDFENCE_ENABLE-}"
     old[WORDFENCE_VULN_ENABLE]="${WORDFENCE_VULN_ENABLE-}"
     old[WORDFENCE_ENABLE_DB]="${WORDFENCE_ENABLE_DB-}"
+    old[SITE_SCAN_UPLOADS_PHP]="${SITE_SCAN_UPLOADS_PHP-}"
     old[REPORTING_ENABLE]="${REPORTING_ENABLE-}"
     old[REPORTING_EMAILS]="${REPORTING_EMAILS-}"
   fi
@@ -165,6 +166,7 @@ create_site_main() {
   local LOCAL_ARCHIVE_RETENTION_DAYS_v RESTIC_RETENTION_DAYS_v LOG_RETENTION_DAYS_v
   local AWS_ACCESS_KEY_ID_v AWS_SECRET_ACCESS_KEY_v AWS_S3_BUCKET_v AWS_REGION_v AWS_S3_PATH_v AWS_RESTIC_PASSWORD_v
   local CLAMAV_ENABLE_v MALDET_ENABLE_v WORDFENCE_ENABLE_v WORDFENCE_VULN_ENABLE_v WORDFENCE_ENABLE_DB_v
+  local SITE_SCAN_UPLOADS_PHP_v
   local REPORTING_ENABLE_v REPORTING_EMAILS_v
 
   SITE_v="$(prompt_value SITE           "Domain name (used for file/dir naming and reports)" "${old[SITE]-$site}")"
@@ -235,6 +237,7 @@ create_site_main() {
   WORDFENCE_ENABLE_v="$(prompt_value WORDFENCE_ENABLE "Enable Wordfence file scan (y/n)" "${old[WORDFENCE_ENABLE]-y}")"
   WORDFENCE_VULN_ENABLE_v="$(prompt_value WORDFENCE_VULN_ENABLE "Enable Wordfence vuln scan (y/n)" "${old[WORDFENCE_VULN_ENABLE]-y}")"
   WORDFENCE_ENABLE_DB_v="$(prompt_value WORDFENCE_ENABLE_DB "Enable Wordfence DB scan (y/n)" "${old[WORDFENCE_ENABLE_DB]-y}")"
+  SITE_SCAN_UPLOADS_PHP_v="$(prompt_value SITE_SCAN_UPLOADS_PHP "Enable Uploads scan for PHP (y/n)" "${old[SITE_SCAN_UPLOADS_PHP]-y}")"
 
   REPORTING_ENABLE_v="$(prompt_value REPORTING_ENABLE "Enable per-site reporting (y/n)" "${old[REPORTING_ENABLE]-y}")"
   REPORTING_EMAILS_v="$(prompt_value REPORTING_EMAILS "Comma/space-separated report recipients" "${old[REPORTING_EMAILS]-midgard@example.com}")"
@@ -316,6 +319,7 @@ HDR
     echo "WORDFENCE_VULN_ENABLE=$(_escape_val "${WORDFENCE_VULN_ENABLE_v:-}")"
     echo "WORDFENCE_ENABLE_DB=$(_escape_val "${WORDFENCE_ENABLE_DB_v:-}")"
     echo "WORDFENCE_DB_REMOVE_POST=\"\""
+    echo "SITE_SCAN_UPLOADS_PHP=$(_escape_val "${SITE_SCAN_UPLOADS_PHP_v:-}")"
     echo
     echo "# Reporting"
     echo "REPORTING_ENABLE=$(_escape_val "${REPORTING_ENABLE_v:-}")"

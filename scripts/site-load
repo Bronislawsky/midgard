@@ -96,6 +96,7 @@ site_load_into() { # $1=site  $2=array_name
   eval "${arr_name}[WORDFENCE_ENABLE_DB]=\"${WORDFENCE_ENABLE_DB:-}\""
   eval "${arr_name}[WORDFENCE_DB_REMOVE_POST]=\"${WORDFENCE_DB_REMOVE_POST:-}\""
   eval "${arr_name}[SITE_SCAN_UPLOADS_PHP]=\"${SITE_SCAN_UPLOADS_PHP:-}\""
+  eval "${arr_name}[PLUGIN_CHECKSUMS]=\"${PLUGIN_CHECKSUMS:-}\""
   eval "${arr_name}[REPORTING_ENABLE]=\"${REPORTING_ENABLE:-}\""
   eval "${arr_name}[REPORTING_EMAILS]=\"${REPORTING_EMAILS:-}\""
 

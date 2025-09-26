@@ -1,0 +1,264 @@
+#!/usr/bin/env bash
+# file : ./scripts/plugin-checksums
+#------------------------------------------------------------------------------
+#
+#         .__    .___                      .___
+#   _____ |__| __| _/ _________ _______  __| _/
+#  /     \|  |/ __ | / ___\__  \\_  __ \/ __ |
+# |  Y Y  \  / /_/ |/ /_/  > __ \|  | \/ /_/ |
+# |__|_|  /__\____ |\___  (____  /__|  \____ |
+#       \/        \/_____/     \/           \/
+#
+# plugin-checksums
+#   - Uses local cache JSON in ./plugin-checksums/<slug>/<version>.json
+#   - Compares against local plugin files to detect:
+#       * missing files (in JSON but not on disk)
+#       * mismatched hashes (md5 differs)
+#       * extra files (on disk but not in JSON)  <-- potential injections
+#   - Appends overall status to reports/$EPOCH_TIMESTAMP/<site>.report
+#   - Logs detailed differences to logs/$EPOCH_TIMESTAMP/<site>.log
+#------------------------------------------------------------------------------
+
+# Safety guard
+if [[ "${MIDGARD_MAIN:-}" != "1" ]]; then
+  echo "This script must be sourced from the midgard launcher." >&2
+  return 1 2>/dev/null || exit 1
+fi
+
+#------------------------------------------------------------------------------
+# Utilities
+#------------------------------------------------------------------------------
+
+# name-ref getter: _get <assoc_array_name> <key>
+_get() {
+  local __arr="$1" __key="$2"
+  declare -n __ref="$__arr"
+  printf '%s' "${__ref[$__key]-}"
+}
+
+#------------------------------------------------------------------------------
+# Version detection
+#------------------------------------------------------------------------------
+
+# Extract "Version: x.y.z" from the first ~120 lines of a PHP file.
+_pc_version_from_php() {
+  local php_file="${1:-}"
+  [[ -r "$php_file" ]] || return 0
+  awk 'NR>120{exit}
+       BEGIN{IGNORECASE=1}
+       /^[[:space:]]*(\*|#|\/\/)?[[:space:]]*Version[[:space:]]*:/{
+         sub(/^[[:space:]]*(\*|#|\/\/)?[[:space:]]*Version[[:space:]]*:[[:space:]]*/, "", $0)
+         gsub(/[[:space:]]+$/, "", $0)
+         print $0; exit
+       }' "$php_file"
+}
+
+# Detect a plugin version by common heuristics
+_pc_detect_plugin_version() {
+  local plugin_dir="${1:-}" slug="${2:-}"
+  local f ver
+
+  # 1) <slug>.php at root
+  f="${plugin_dir%/}/${slug}.php"
+  if [[ -f "$f" ]]; then
+    ver="$(_pc_version_from_php "$f")"
+    [[ -n "$ver" ]] && { printf '%s\n' "$ver"; return 0; }
+  fi
+
+  # 2) any top-level *.php that has a plugin header
+  local cand
+  while IFS= read -r -d '' cand; do
+    if awk 'NR>80{exit} BEGIN{IGNORECASE=1} /Plugin[[:space:]]+Name[[:space:]]*:/ {found=1; exit} END{exit found?0:1}' "$cand"
+    then
+      ver="$(_pc_version_from_php "$cand")"
+      [[ -n "$ver" ]] && { printf '%s\n' "$ver"; return 0; }
+    fi
+  done < <(find "$plugin_dir" -maxdepth 1 -type f -name '*.php' -print0 2>/dev/null)
+
+  # 3) readme.txt Stable tag:
+  f="${plugin_dir%/}/readme.txt"
+  if [[ -f "$f" ]]; then
+    ver="$(
+      awk 'BEGIN{IGNORECASE=1}
+           /^[[:space:]]*Stable[[:space:]]+tag[[:space:]]*:/{
+             sub(/^[[:space:]]*Stable[[:space:]]+tag[[:space:]]*:[[:space:]]*/, "", $0)
+             gsub(/[[:space:]]+$/, "", $0)
+             print $0; exit
+           }' "$f"
+    )"
+    [[ -n "$ver" ]] && { printf '%s\n' "$ver"; return 0; }
+  fi
+
+  printf 'unknown\n'
+}
+
+#------------------------------------------------------------------------------
+# Cache + compare
+#------------------------------------------------------------------------------
+
+# Return the path to the cached checksum JSON if it exists.
+# Layout: ./plugin-checksums/<slug>/<version>.json
+_pc_cache_file_for() {
+  local slug="$1" ver="$2"
+  local path="./plugin-checksums/${slug}/${ver}.json"
+  [[ -f "$path" ]] && printf '%s\n' "$path"
+}
+
+# Compare JSON checksums to on-disk plugin files.
+# Prints one summary line; returns 0 on OK, 1 on FAIL, 2 if no cache (private/unknown).
+_pc_compare_from_cache() {
+  local plugin_dir="$1" slug="$2" ver="$3"
+  local cache="$(_pc_cache_file_for "$slug" "$ver")"
+  [[ -n "$cache" ]] || { printf "%s %s PRIVATE\n" "$slug" "$ver"; return 2; }
+
+  if ! command -v jq >/dev/null 2>&1; then
+    printf "%s %s ERR(no-jq)\n" "$slug" "$ver"
+    return 1
+  fi
+
+  # temp files
+  local expected_list expected_list_sorted expected_map
+  local local_list_sorted miss_list mm_list extra_list
+  expected_list="$(mktemp)"
+  expected_list_sorted="$(mktemp)"
+  expected_map="$(mktemp)"
+  local_list_sorted="$(mktemp)"
+  miss_list="$(mktemp)"
+  mm_list="$(mktemp)"
+  extra_list="$(mktemp)"
+
+  # Build expected keys and a TSV map "<path>\t<md5>"
+  # NOTE: cache value may be {"md5":"...","sha256":"..."} OR a plain string md5
+  if ! jq -r '.files | keys[]' "$cache" >"$expected_list"; then
+    printf "%s %s ERR(bad-json)\n" "$slug" "$ver"
+    rm -f "$expected_list" "$expected_list_sorted" "$expected_map" \
+          "$local_list_sorted" "$miss_list" "$mm_list" "$extra_list"
+    return 1
+  fi
+  jq -r '.files | to_entries[] | [.key, (.value.md5 // .value // "")] | @tsv' "$cache" >"$expected_map"
+  LC_ALL=C sort -u "$expected_list" >"$expected_list_sorted"
+
+  # Gather local files (sorted)
+  pushd "$plugin_dir" >/dev/null || {
+    printf "%s %s ERR(no-plugin-dir)\n" "$slug" "$ver"
+    rm -f "$expected_list" "$expected_list_sorted" "$expected_map" \
+          "$local_list_sorted" "$miss_list" "$mm_list" "$extra_list"
+    return 1
+  }
+  LC_ALL=C find . -type f -print | sed 's|^\./||' | LC_ALL=C sort -u >"$local_list_sorted"
+
+  # Compare expected vs local
+  local missing=0 mismatched=0 extras=0 file expected_md5 actual_md5
+  while IFS= read -r file; do
+    if [[ ! -f "$file" ]]; then
+      ((missing++)); echo "$file" >>"$miss_list"
+    else
+      expected_md5="$(awk -F'\t' -v f="$file" '$1==f{print $2; exit}' "$expected_map")"
+      if [[ -n "$expected_md5" ]]; then
+        actual_md5="$(md5sum -- "$file" | awk '{print $1}')"
+        if [[ "$actual_md5" != "$expected_md5" ]]; then
+          ((mismatched++)); echo "$file" >>"$mm_list"
+        fi
+      else
+        ((missing++)); echo "$file" >>"$miss_list"
+      fi
+    fi
+  done <"$expected_list_sorted"
+
+  # Extras = local - expected (both sorted)
+  LC_ALL=C comm -23 "$local_list_sorted" "$expected_list_sorted" >"$extra_list"
+  extras="$(wc -l <"$extra_list" | awk '{print $1}')"
+
+  popd >/dev/null || true
+
+  # Result
+  if (( missing==0 && mismatched==0 && extras==0 )); then
+    printf "%s %s OK\n" "$slug" "$ver"
+    rm -f "$expected_list" "$expected_list_sorted" "$expected_map" \
+          "$local_list_sorted" "$miss_list" "$mm_list" "$extra_list"
+    return 0
+  else
+    printf "%s %s FAIL missing=%d mismatched=%d extra=%d\n" "$slug" "$ver" "$missing" "$mismatched" "$extras"
+    # Append detailed lists to site_log if set in caller scope
+    if [[ -n "${site_log:-}" ]]; then
+      {
+        ((missing))    && { echo "  [missing]";    sed 's/^/    - /' "$miss_list"; }
+        ((mismatched)) && { echo "  [mismatched]"; sed 's/^/    - /' "$mm_list"; }
+        ((extras))     && { echo "  [extra]";      sed 's/^/    - /' "$extra_list"; }
+      } >>"$site_log"
+    fi
+    rm -f "$expected_list" "$expected_list_sorted" "$expected_map" \
+          "$local_list_sorted" "$miss_list" "$mm_list" "$extra_list"
+    return 1
+  fi
+}
+
+#------------------------------------------------------------------------------
+# Public API
+#------------------------------------------------------------------------------
+
+# Usage: plugin_checksums_site "<site>"
+plugin_checksums_site() {
+
+  local site="${1:-}"
+  [[ -n "$site" ]] || { echo "plugin_checksums_site: missing site"; return 1; }
+
+  local arr="${CONFIG_SITES[$site]:-}"
+  [[ -n "$arr" ]] || { echo "plugin_checksums_site: site not loaded: $site"; return 1; }
+
+  # Pull vars from loaded site map
+  local LOCAL_SYNC_PATH PLUGIN_CHECKSUMS LOCAL_DOCUMENT_ROOT LOCAL_WEBROOT LOCAL_PLUGINS_DIR
+  LOCAL_SYNC_PATH="$(_get "$arr" LOCAL_SYNC_PATH)"
+  PLUGIN_CHECKSUMS="$(_get "$arr" PLUGIN_CHECKSUMS)"
+  LOCAL_DOCUMENT_ROOT="$(_get "$arr" LOCAL_DOCUMENT_ROOT)"
+  LOCAL_WEBROOT="${LOCAL_SYNC_PATH}${LOCAL_DOCUMENT_ROOT}"
+  LOCAL_PLUGINS_DIR="${LOCAL_WEBROOT}/wp-content/plugins"
+
+  local log_dir="logs/${EPOCH_TIMESTAMP}"
+  local rep_dir="reports/${EPOCH_TIMESTAMP}"
+  site_log="${log_dir}/${site}.log"
+  local site_rep="${rep_dir}/${site}.report"
+  mkdir -p "$log_dir" "$rep_dir"
+
+  # Respect per-site toggle
+  if [[ "${PLUGIN_CHECKSUMS}" != "y" ]]; then
+    echo "  plugin checksums ${site} ... [SKIPPED]" | tee -a "$site_log"
+    echo "PLUGIN_CHECKSUMS=SKIPPED" >> "$site_rep"
+    return 0
+  fi
+
+  [[ -d "$LOCAL_PLUGINS_DIR" ]] || {
+    echo "  plugin checksums ${site} ... [NO PLUGINS]" | tee -a "$site_log"
+    echo "PLUGIN_CHECKSUMS=NO_PLUGINS" >> "$site_rep"
+    return 0
+  }
+
+  local rc_all=0
+  shopt -s nullglob
+  local d slug ver line rc
+  for d in "$LOCAL_PLUGINS_DIR"/*/; do
+    [[ -d "$d" ]] || continue
+    slug="$(basename "${d%/}")"
+    [[ "$slug" == .* ]] && continue
+
+    ver="$(_pc_detect_plugin_version "$d" "$slug")"
+    if [[ "$ver" == "unknown" || -z "$ver" ]]; then
+      line="${slug} unknown FAIL version"
+      echo "$line" | tee -a "$site_log"
+      rc_all=1
+      continue
+    fi
+
+    line="$(_pc_compare_from_cache "$d" "$slug" "$ver")"
+    rc=$?
+    echo "$line" | tee -a "$site_log"
+    [[ $rc -eq 1 ]] && rc_all=1
+  done
+
+  if [[ $rc_all -eq 0 ]]; then
+    echo "PLUGIN_CHECKSUMS=OK" >> "$site_rep"
+  else
+    echo "PLUGIN_CHECKSUMS=FAIL" >> "$site_rep"
+  fi
+}
+# (EOF)

@@ -85,6 +85,9 @@ source "$(dirname "$0")/scripts/scan-wordfence-db"
 # uploads scan for PHP
 source "$(dirname "$0")/scripts/scan-uploads-php"
 
+# check plugin checkums
+source "$(dirname "$0")/scripts/plugin-checksums"
+
 # Amazon S3 Restic Sync
 source "$(dirname "$0")/scripts/restic-sync"
 
@@ -195,6 +198,11 @@ for enabled_site in "${ENABLED_SITES[@]}"; do
   # Uploads PHP Scan
   if ! scan_uploads_php_site "$enabled_site"; then
     echo "    - scan for uploads php failed for ${enabled_site}";
+  fi
+
+  # check plugin checksums
+  if ! plugin_checksums_site "$enabled_site"; then
+    echo "    - plugins checksums core failed for ${enabled_site}";
   fi
 
   # ClamAV

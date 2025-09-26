@@ -55,7 +55,7 @@ _sl_read_kv_file() { # $1=file  $2=regex(keys)
 }
 
 # Load one site's settings into an associative array whose name is passed as $2.
-# Usage: site_load_into "visionprosante.com" "SITES_visionprosante_com"
+# Usage: site_load_into "example.com" "SITES_example_com"
 site_load_into() { # $1=site  $2=array_name
   local site="$1" arr_name="$2"
   [[ -n "$site" && -n "$arr_name" ]] || { echo "site_load_into <site> <array_name>"; return 1; }
@@ -97,6 +97,8 @@ site_load_into() { # $1=site  $2=array_name
   eval "${arr_name}[WORDFENCE_DB_REMOVE_POST]=\"${WORDFENCE_DB_REMOVE_POST:-}\""
   eval "${arr_name}[SITE_SCAN_UPLOADS_PHP]=\"${SITE_SCAN_UPLOADS_PHP:-}\""
   eval "${arr_name}[PLUGIN_CHECKSUMS]=\"${PLUGIN_CHECKSUMS:-}\""
+  eval "${arr_name}[THEME_CHECKSUMS]=\"${THEME_CHECKSUMS:-}\""
+  eval "${arr_name}[WORDPRESS_CHECKSUMS]=\"${WORDPRESS_CHECKSUMS:-}\""
   eval "${arr_name}[REPORTING_ENABLE]=\"${REPORTING_ENABLE:-}\""
   eval "${arr_name}[REPORTING_EMAILS]=\"${REPORTING_EMAILS:-}\""
 

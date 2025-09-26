@@ -15,7 +15,7 @@
 #   ./midgard aws-policy <bucket-domain> <prefix-domain>
 #
 # Example:
-#   ./midgard aws-policy midgard.dbc.ca herbic.com
+#   ./midgard aws-policy midgard.example.ca example.com
 #
 # Notes:
 #   - Bucket/domain/prefix are normalized to lowercase.
@@ -100,7 +100,7 @@ aws_policy() {
 
   if [[ -z "${bucket_in:-}" || -z "${prefix_in:-}" ]]; then
     echo "Usage: aws_policy <bucket-domain> <prefix-domain>"
-    echo "Example: aws_policy midgard.dbc.ca herbic.com"
+    echo "Example: aws_policy midgard.example.ca example.com"
     return 1
   fi
 

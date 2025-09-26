@@ -129,6 +129,8 @@ create_site_main() {
     old[WORDFENCE_ENABLE_DB]="${WORDFENCE_ENABLE_DB-}"
     old[SITE_SCAN_UPLOADS_PHP]="${SITE_SCAN_UPLOADS_PHP-}"
     old[PLUGIN_CHECKSUMS]="${PLUGIN_CHECKSUMS-}"
+    old[THEME_CHECKSUMS]="${THEME_CHECKSUMS-}"
+    old[WORDPRESS_CHECKSUMS]="${WORDPRESS_CHECKSUMS-}"
     old[REPORTING_ENABLE]="${REPORTING_ENABLE-}"
     old[REPORTING_EMAILS]="${REPORTING_EMAILS-}"
   fi
@@ -167,7 +169,7 @@ create_site_main() {
   local LOCAL_ARCHIVE_RETENTION_DAYS_v RESTIC_RETENTION_DAYS_v LOG_RETENTION_DAYS_v
   local AWS_ACCESS_KEY_ID_v AWS_SECRET_ACCESS_KEY_v AWS_S3_BUCKET_v AWS_REGION_v AWS_S3_PATH_v AWS_RESTIC_PASSWORD_v
   local CLAMAV_ENABLE_v MALDET_ENABLE_v WORDFENCE_ENABLE_v WORDFENCE_VULN_ENABLE_v WORDFENCE_ENABLE_DB_v
-  local SITE_SCAN_UPLOADS_PHP_v PLUGIN_CHECKSUMS_v
+  local SITE_SCAN_UPLOADS_PHP_v PLUGIN_CHECKSUMS_v WORDPRESS_CHECKSUMS_v THEME_CHECKSUMS_v
   local REPORTING_ENABLE_v REPORTING_EMAILS_v
 
   SITE_v="$(prompt_value SITE           "Domain name (used for file/dir naming and reports)" "${old[SITE]-$site}")"
@@ -239,7 +241,9 @@ create_site_main() {
   WORDFENCE_VULN_ENABLE_v="$(prompt_value WORDFENCE_VULN_ENABLE "Enable Wordfence vuln scan (y/n)" "${old[WORDFENCE_VULN_ENABLE]-y}")"
   WORDFENCE_ENABLE_DB_v="$(prompt_value WORDFENCE_ENABLE_DB "Enable Wordfence DB scan (y/n)" "${old[WORDFENCE_ENABLE_DB]-y}")"
   SITE_SCAN_UPLOADS_PHP_v="$(prompt_value SITE_SCAN_UPLOADS_PHP "Enable Uploads scan for PHP (y/n)" "${old[SITE_SCAN_UPLOADS_PHP]-y}")"
-  PLUGIN_CHECKSUMS_v="$(prompt_value PLUGIN_CHECKSUMS "scan plugins checksums (y/n)" "${old[PLUGIN_CHECKSUMS]-y}")"
+  PLUGIN_CHECKSUMS_v="$(prompt_value PLUGIN_CHECKSUMS "scan plugin checksums (y/n)" "${old[PLUGIN_CHECKSUMS]-y}")"
+  THEME_CHECKSUMS_v="$(prompt_value THEME_CHECKSUMS "scan theme checksums (y/n)" "${old[THEME_CHECKSUMS]-y}")"
+  WORDPRESS_CHECKSUMS_v="$(prompt_value WORDPRESS_CHECKSUMS "scan wordpress checksums (y/n)" "${old[WORDPRESS_CHECKSUMS]-y}")"
 
   REPORTING_ENABLE_v="$(prompt_value REPORTING_ENABLE "Enable per-site reporting (y/n)" "${old[REPORTING_ENABLE]-y}")"
   REPORTING_EMAILS_v="$(prompt_value REPORTING_EMAILS "Comma/space-separated report recipients" "${old[REPORTING_EMAILS]-midgard@example.com}")"
@@ -323,6 +327,8 @@ HDR
     echo "WORDFENCE_DB_REMOVE_POST=\"\""
     echo "SITE_SCAN_UPLOADS_PHP=$(_escape_val "${SITE_SCAN_UPLOADS_PHP_v:-}")"
     echo "PLUGIN_CHECKSUMS=$(_escape_val "${PLUGIN_CHECKSUMS_v:-}")"
+    echo "THEME_CHECKSUMS=$(_escape_val "${THEME_CHECKSUMS_v:-}")"
+    echo "WORDPRESS_CHECKSUMS=$(_escape_val "${WORDPRESS_CHECKSUMS_v:-}")"
     echo
     echo "# Reporting"
     echo "REPORTING_ENABLE=$(_escape_val "${REPORTING_ENABLE_v:-}")"

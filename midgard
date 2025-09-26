@@ -88,6 +88,12 @@ source "$(dirname "$0")/scripts/scan-uploads-php"
 # check plugin checkums
 source "$(dirname "$0")/scripts/plugin-checksums"
 
+# check plugin checkums
+source "$(dirname "$0")/scripts/theme-checksums"
+
+# wordpress checkums
+source "$(dirname "$0")/scripts/wordpress-checksums"
+
 # Amazon S3 Restic Sync
 source "$(dirname "$0")/scripts/restic-sync"
 
@@ -201,8 +207,19 @@ for enabled_site in "${ENABLED_SITES[@]}"; do
   fi
 
   # check plugin checksums
+  if ! theme_checksums_site "$enabled_site"; then
+    echo "    - theme checksums core failed for ${enabled_site}";
+  fi
+
+  # check plugin checksums
   if ! plugin_checksums_site "$enabled_site"; then
-    echo "    - plugins checksums core failed for ${enabled_site}";
+    echo "    - plugin checksums core failed for ${enabled_site}";
+  fi
+
+
+  # check wordpress checksums
+  if ! wordpress_checksums_site "$enabled_site"; then
+    echo "    - wordpress checksums failed for ${enabled_site}";
   fi
 
   # ClamAV

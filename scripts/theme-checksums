@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# file : ./scripts/plugin-checksums
+# file : ./scripts/theme-checksums
 #------------------------------------------------------------------------------
 #
 #         .__    .___                      .___
@@ -9,10 +9,10 @@
 # |__|_|  /__\____ |\___  (____  /__|  \____ |
 #       \/        \/_____/     \/           \/
 #
-# plugin-checksums
-#   - Uses local cache JSON in ./plugin-checksums/<slug>/<version>.json
-#   - If missing, auto-fetch from downloads.wordpress.org/plugin-checksums/<slug>/<version>.json
-#   - Compares against local plugin files to detect:
+# theme-checksums
+#   - Uses local cache JSON in ./theme-checksums/<slug>/<version>.json
+#   - (No official auto-fetch for themes; if cache missing -> PRIVATE)
+#   - Compares against local theme files to detect:
 #       * missing files (in JSON but not on disk)
 #       * mismatched hashes (md5 differs)
 #       * extra files (on disk but not in JSON)  <-- potential injections
@@ -38,46 +38,34 @@ _get() {
 }
 
 #------------------------------------------------------------------------------
-# Version detection
+# Version detection (themes)
 #------------------------------------------------------------------------------
 
-# Extract "Version: x.y.z" from the first ~120 lines of a PHP file.
-_pc_version_from_php() {
-  local php_file="${1:-}"
-  [[ -r "$php_file" ]] || return 0
+# Extract "Version: x.y.z" from style.css header (first ~120 lines).
+_tc_version_from_style() {
+  local css_file="${1:-}"
+  [[ -r "$css_file" ]] || return 0
   awk 'NR>120{exit}
        BEGIN{IGNORECASE=1}
        /^[[:space:]]*(\*|#|\/\/)?[[:space:]]*Version[[:space:]]*:/{
          sub(/^[[:space:]]*(\*|#|\/\/)?[[:space:]]*Version[[:space:]]*:[[:space:]]*/, "", $0)
          gsub(/[[:space:]]+$/, "", $0)
          print $0; exit
-       }' "$php_file"
+       }' "$css_file"
 }
 
-# Detect a plugin version by common heuristics
-_pc_detect_plugin_version() {
-  local plugin_dir="${1:-}" slug="${2:-}"
-  local f ver
+# Themes commonly keep version only in style.css. Try that; fall back to readme.txt "Stable tag".
+_tc_detect_theme_version() {
+  local theme_dir="${1:-}"
+  local ver f
 
-  # 1) <slug>.php at root
-  f="${plugin_dir%/}/${slug}.php"
+  f="${theme_dir%/}/style.css"
   if [[ -f "$f" ]]; then
-    ver="$(_pc_version_from_php "$f")"
+    ver="$(_tc_version_from_style "$f")"
     [[ -n "$ver" ]] && { printf '%s\n' "$ver"; return 0; }
   fi
 
-  # 2) any top-level *.php that has a plugin header
-  local cand
-  while IFS= read -r -d '' cand; do
-    if awk 'NR>80{exit} BEGIN{IGNORECASE=1} /Plugin[[:space:]]+Name[[:space:]]*:/ {found=1; exit} END{exit found?0:1}' "$cand"
-    then
-      ver="$(_pc_version_from_php "$cand")"
-      [[ -n "$ver" ]] && { printf '%s\n' "$ver"; return 0; }
-    fi
-  done < <(find "$plugin_dir" -maxdepth 1 -type f -name '*.php' -print0 2>/dev/null)
-
-  # 3) readme.txt Stable tag:
-  f="${plugin_dir%/}/readme.txt"
+  f="${theme_dir%/}/readme.txt"
   if [[ -f "$f" ]]; then
     ver="$(
       awk 'BEGIN{IGNORECASE=1}
@@ -94,64 +82,32 @@ _pc_detect_plugin_version() {
 }
 
 #------------------------------------------------------------------------------
-# Cache + auto-fetch + compare
+# Cache + compare
 #------------------------------------------------------------------------------
 
-# Return path to our cache file path (does not ensure existence)
-_pc_cache_path() {
+# Return path for cache file (does not ensure it exists)
+_tc_cache_path() {
   local slug="$1" ver="$2"
-  printf './plugin-checksums/%s/%s.json\n' "$slug" "$ver"
+  printf './theme-checksums/%s/%s.json\n' "$slug" "$ver"
 }
 
-# Try to fetch checksum JSON from WordPress.org and save into cache.
-# Returns 0 if fetched and valid, 1 otherwise.
-_pc_try_fetch_cache() {
+# Return the path to the cached checksum JSON; no auto-fetch (themes lack an official API)
+_tc_cache_file_for() {
   local slug="$1" ver="$2"
-  local url="https://downloads.wordpress.org/plugin-checksums/${slug}/${ver}.json"
-  local out="$(_pc_cache_path "$slug" "$ver")"
-  local outdir; outdir="$(dirname "$out")"
-  mkdir -p "$outdir"
-
-  # need curl and jq
-  command -v curl >/dev/null 2>&1 || return 1
-  command -v jq >/dev/null 2>&1 || return 1
-
-  # fetch
-  local tmp
-  tmp="$(mktemp)"
-  if ! curl -fsSL --connect-timeout 10 --max-time 30 --retry 2 --retry-delay 1 \
-       -o "$tmp" "$url"; then
-    rm -f "$tmp"
-    return 1
-  fi
-
-  # validate shape minimally: has top-level "files" object with at least one key
-  if ! jq -e 'has("files") and (.files|type=="object") and ((.files|length) > 0)' "$tmp" >/dev/null 2>&1; then
-    rm -f "$tmp"
-    return 1
-  fi
-
-  mv -f "$tmp" "$out"
-  return 0
+  local path="$(_tc_cache_path "$slug" "$ver")"
+  [[ -f "$path" ]] && { printf '%s\n' "$path"; return 0; }
+  return 1
 }
 
-# Return the path to the cached checksum JSON, auto-fetching if needed.
-_pc_cache_file_for() {
-  local slug="$1" ver="$2"
-  local path="$(_pc_cache_path "$slug" "$ver")"
-  [[ -f "$path" ]] || _pc_try_fetch_cache "$slug" "$ver" || return 1
-  printf '%s\n' "$path"
-}
-
-# Compare JSON checksums to on-disk plugin files.
+# Compare JSON checksums to on-disk theme files.
 # Prints one summary line; returns:
 #   0 OK
 #   1 FAIL (missing/mismatched/extra or errors)
-#   2 PRIVATE (no cache available and remote fetch not possible)
-_pc_compare_from_cache() {
-  local plugin_dir="$1" slug="$2" ver="$3"
+#   2 PRIVATE (no cache JSON)
+_tc_compare_from_cache() {
+  local theme_dir="$1" slug="$2" ver="$3"
   local cache
-  if ! cache="$(_pc_cache_file_for "$slug" "$ver")"; then
+  if ! cache="$(_tc_cache_file_for "$slug" "$ver")"; then
     printf "%s %s PRIVATE\n" "$slug" "$ver"
     return 2
   fi
@@ -161,7 +117,7 @@ _pc_compare_from_cache() {
     return 1
   fi
 
-  # temp files
+  # temps
   local expected_list expected_list_sorted expected_map
   local local_list_sorted miss_list mm_list extra_list
   expected_list="$(mktemp)"
@@ -172,7 +128,7 @@ _pc_compare_from_cache() {
   mm_list="$(mktemp)"
   extra_list="$(mktemp)"
 
-  # Build expected keys and a TSV map "<path>\t<md5>"
+  # JSON shape matches your cache (like plugins): top-level {"files": { "path": {"md5": "..."} , ... }}
   if ! jq -r '.files | keys[]' "$cache" >"$expected_list"; then
     printf "%s %s ERR(bad-json)\n" "$slug" "$ver"
     rm -f "$expected_list" "$expected_list_sorted" "$expected_map" \
@@ -182,16 +138,16 @@ _pc_compare_from_cache() {
   jq -r '.files | to_entries[] | [.key, (.value.md5 // .value // "")] | @tsv' "$cache" >"$expected_map"
   LC_ALL=C sort -u "$expected_list" >"$expected_list_sorted"
 
-  # Gather local files (sorted)
-  pushd "$plugin_dir" >/dev/null || {
-    printf "%s %s ERR(no-plugin-dir)\n" "$slug" "$ver"
+  # local files (relative to theme dir)
+  pushd "$theme_dir" >/dev/null || {
+    printf "%s %s ERR(no-theme-dir)\n" "$slug" "$ver"
     rm -f "$expected_list" "$expected_list_sorted" "$expected_map" \
           "$local_list_sorted" "$miss_list" "$mm_list" "$extra_list"
     return 1
   }
   LC_ALL=C find . -type f -print | sed 's|^\./||' | LC_ALL=C sort -u >"$local_list_sorted"
 
-  # Compare expected vs local
+  # Compare
   local missing=0 mismatched=0 extras=0 file expected_md5 actual_md5
   while IFS= read -r file; do
     if [[ ! -f "$file" ]]; then
@@ -209,7 +165,7 @@ _pc_compare_from_cache() {
     fi
   done <"$expected_list_sorted"
 
-  # Extras = local - expected (both sorted)
+  # Extras (local but not expected)
   LC_ALL=C comm -23 "$local_list_sorted" "$expected_list_sorted" >"$extra_list"
   extras="$(wc -l <"$extra_list" | awk '{print $1}')"
 
@@ -240,22 +196,22 @@ _pc_compare_from_cache() {
 # Public API
 #------------------------------------------------------------------------------
 
-# Usage: plugin_checksums_site "<site>"
-plugin_checksums_site() {
+# Usage: theme_checksums_site "<site>"
+theme_checksums_site() {
 
   local site="${1:-}"
-  [[ -n "$site" ]] || { echo "plugin_checksums_site: missing site"; return 1; }
+  [[ -n "$site" ]] || { echo "theme_checksums_site: missing site"; return 1; }
 
   local arr="${CONFIG_SITES[$site]:-}"
-  [[ -n "$arr" ]] || { echo "plugin_checksums_site: site not loaded: $site"; return 1; }
+  [[ -n "$arr" ]] || { echo "theme_checksums_site: site not loaded: $site"; return 1; }
 
   # Pull vars from loaded site map
-  local LOCAL_SYNC_PATH PLUGIN_CHECKSUMS LOCAL_DOCUMENT_ROOT LOCAL_WEBROOT LOCAL_PLUGINS_DIR
+  local LOCAL_SYNC_PATH THEME_CHECKSUMS LOCAL_DOCUMENT_ROOT LOCAL_WEBROOT LOCAL_THEMES_DIR
   LOCAL_SYNC_PATH="$(_get "$arr" LOCAL_SYNC_PATH)"
-  PLUGIN_CHECKSUMS="$(_get "$arr" PLUGIN_CHECKSUMS)"
+  THEME_CHECKSUMS="$(_get "$arr" THEME_CHECKSUMS)"
   LOCAL_DOCUMENT_ROOT="$(_get "$arr" LOCAL_DOCUMENT_ROOT)"
   LOCAL_WEBROOT="${LOCAL_SYNC_PATH}${LOCAL_DOCUMENT_ROOT}"
-  LOCAL_PLUGINS_DIR="${LOCAL_WEBROOT}/wp-content/plugins"
+  LOCAL_THEMES_DIR="${LOCAL_WEBROOT}/wp-content/themes"
 
   local log_dir="logs/${EPOCH_TIMESTAMP}"
   local rep_dir="reports/${EPOCH_TIMESTAMP}"
@@ -264,27 +220,27 @@ plugin_checksums_site() {
   mkdir -p "$log_dir" "$rep_dir"
 
   # Respect per-site toggle
-  if [[ "${PLUGIN_CHECKSUMS}" != "y" ]]; then
-    echo "  plugin checksums ${site} ... [SKIPPED]" | tee -a "$site_log"
-    echo "PLUGIN_CHECKSUMS=SKIPPED" >> "$site_rep"
+  if [[ "${THEME_CHECKSUMS}" != "y" ]]; then
+    echo "  theme checksums ${site} ... [SKIPPED]" | tee -a "$site_log"
+    echo "THEME_CHECKSUMS=SKIPPED" >> "$site_rep"
     return 0
   fi
 
-  [[ -d "$LOCAL_PLUGINS_DIR" ]] || {
-    echo "  plugin checksums ${site} ... [NO PLUGINS]" | tee -a "$site_log"
-    echo "PLUGIN_CHECKSUMS=NO_PLUGINS" >> "$site_rep"
+  [[ -d "$LOCAL_THEMES_DIR" ]] || {
+    echo "  theme checksums ${site} ... [NO THEMES]" | tee -a "$site_log"
+    echo "THEME_CHECKSUMS=NO_THEMES" >> "$site_rep"
     return 0
   }
 
   local rc_all=0
   shopt -s nullglob
   local d slug ver line rc
-  for d in "$LOCAL_PLUGINS_DIR"/*/; do
+  for d in "$LOCAL_THEMES_DIR"/*/; do
     [[ -d "$d" ]] || continue
     slug="$(basename "${d%/}")"
     [[ "$slug" == .* ]] && continue
 
-    ver="$(_pc_detect_plugin_version "$d" "$slug")"
+    ver="$(_tc_detect_theme_version "$d")"
     if [[ "$ver" == "unknown" || -z "$ver" ]]; then
       line="${slug} unknown FAIL version"
       echo "$line" | tee -a "$site_log"
@@ -292,16 +248,16 @@ plugin_checksums_site() {
       continue
     fi
 
-    line="$(_pc_compare_from_cache "$d" "$slug" "$ver")"
+    line="$(_tc_compare_from_cache "$d" "$slug" "$ver")"
     rc=$?
     echo "$line" | tee -a "$site_log"
     [[ $rc -eq 1 ]] && rc_all=1
   done
 
   if [[ $rc_all -eq 0 ]]; then
-    echo "PLUGIN_CHECKSUMS=OK" >> "$site_rep"
+    echo "THEME_CHECKSUMS=OK" >> "$site_rep"
   else
-    echo "PLUGIN_CHECKSUMS=FAIL" >> "$site_rep"
+    echo "THEME_CHECKSUMS=FAIL" >> "$site_rep"
   fi
 }
 # (EOF)

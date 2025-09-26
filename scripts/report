@@ -46,6 +46,8 @@ _report_items=(
   "Wordfence Database Scan|WORDFENCE_DB"
   "Scan Uploads for PHP|UPLOADS_PHP"
   "Plugin Checksums|PLUGIN_CHECKSUMS"
+  "Theme Checksums|THEME_CHECKSUMS"
+  "Wordpress Checksums|WORDPRESS_CHECKSUMS"
   "Restic Backup Sync|RESTIC"
 )
 

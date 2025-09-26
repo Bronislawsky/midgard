@@ -1,0 +1,285 @@
+#!/usr/bin/env bash
+# file : ./scripts/wordpress-checksums
+#------------------------------------------------------------------------------
+#
+#         .__    .___                      .___
+#   _____ |__| __| _/ _________ _______  __| _/
+#  /     \|  |/ __ | / ___\__  \\_  __ \/ __ |
+# |  Y Y  \  / /_/ |/ /_/  > __ \|  | \/ /_/ |
+# |__|_|  /__\____ |\___  (____  /__|  \____ |
+#       \/        \/_____/     \/           \/
+#
+# wordpress-checksums
+#   - Uses local cache JSON in ./wordpress-checksums/<version>[-<locale>].json
+#   - Compares core files to detect: missing / mismatched / extra
+#   - Skips plugins & themes, plus configurable extra ignore paths (relative)
+#   - When any differences exist, ECHO and LOG the missing/mismatched/extra lists
+#   - Writes ONE summary line to reports/$EPOCH_TIMESTAMP/<site>.report
+#------------------------------------------------------------------------------
+
+# Safety guard
+if [[ "${MIDGARD_MAIN:-}" != "1" ]]; then
+  echo "This script must be sourced from the midgard launcher." >&2
+  return 1 2>/dev/null || exit 1
+fi
+
+#------------------------------------------------------------------------------
+# Configurable ignore list (relative to webroot) for "extra" detection
+#------------------------------------------------------------------------------
+IGNORE_PATH=(
+  "wp-content/cache"
+  "wp-content/et-cache"
+  "wp-content/uploads"
+  "wp-content/wp-rocket-config"
+  "wp-content/wflogs"
+  "wp-content/languages"
+)
+
+#------------------------------------------------------------------------------
+# Utilities
+#------------------------------------------------------------------------------
+
+# name-ref getter: _get <assoc_array_name> <key>
+_get() {
+  local __arr="$1" __key="$2"
+  declare -n __ref="$__arr"
+  printf '%s' "${__ref[$__key]-}"
+}
+
+# Extract quoted scalar assigned in version.php:
+_php_extract_assigned_scalar() {
+  local file="$1" varname="$2"
+  [[ -r "$file" ]] || return 1
+  awk -v v="$varname" '
+    $0 ~ "\\$" v "[[:space:]]*=" {
+      s=$0
+      sub(/.*=/, "", s)
+      gsub(/[[:space:]]*;[[:space:]]*$/, "", s)
+      gsub(/^[[:space:]]+|[[:space:]]+$/, "", s)
+      q = substr(s,1,1)
+      if (q == "\"" || q == "'\''") {
+        rest = substr(s,2)
+        pos = index(rest, q)
+        if (pos > 0) { print substr(rest, 1, pos-1); exit }
+      }
+    }
+  ' "$file"
+}
+
+# Prefer version-locale.json if locale present & exists, else version.json
+_wp_core_cache_file_for() {
+  local ver="$1" loc="$2"
+  local base="./wordpress-checksums"
+  if [[ -n "$loc" && -f "${base}/${ver}-${loc}.json" ]]; then
+    printf '%s\n' "${base}/${ver}-${loc}.json"; return 0
+  fi
+  [[ -f "${base}/${ver}.json" ]] && printf '%s\n' "${base}/${ver}.json"
+}
+
+# Convert cache JSON to TSV "<path>\t<md5>", normalizing paths and
+# **excluding** wp-content/plugins/** and wp-content/themes/**
+_wp_core_cache_to_tsv() {
+  local cache="$1"
+  jq -r '
+    def norm($p):
+      ($p
+        | gsub("^\\./"; "")
+        | gsub("^wordpress/"; "")
+      );
+
+    def keep($p):
+      ( ($p | startswith("wp-content/plugins/"))
+        or ($p | startswith("wp-content/themes/")) ) | not;
+
+    if has("files") then
+      .files
+      | to_entries[]
+      | .key as $k
+      | [ norm($k), ( .value.md5 // .value // "" ) ]
+      | select( keep(.[0]) and (.[0] != "") and (.[1] != "") )
+      | @tsv
+    elif has("checksums") then
+      .checksums
+      | to_entries[]
+      | .key as $k
+      | [ norm($k), .value ]
+      | select( keep(.[0]) and (.[0] != "") and (.[1] != "") )
+      | @tsv
+    elif type == "object" then
+      to_entries[]
+      | .key as $k
+      | [ norm($k), ( .value.md5 // .value // "" ) ]
+      | select( keep(.[0]) and (.[0] != "") and (.[1] != "") )
+      | @tsv
+    elif type == "array" then
+      .[]
+      | [ norm(.path // .file // .name // ""), ( .md5 // .hash // "" ) ]
+      | select( keep(.[0]) and (.[0] != "") and (.[1] != "") )
+      | @tsv
+    else
+      empty
+    end
+  ' "$cache"
+}
+
+# Should a local file (relative) be ignored as an "extra"?
+_wp_ignore_extra() {
+  local rel="$1" i
+  for i in "${IGNORE_PATH[@]}"; do
+    case "$rel" in
+      ${i}/*|${i}) return 0 ;;
+    esac
+  done
+  case "$rel" in
+    wp-content/plugins/*)  return 0 ;;
+    wp-content/themes/*)   return 0 ;;
+    wp-config.php)         return 0 ;;
+    .htaccess|web.config)  return 0 ;;
+    robots.txt)            return 0 ;;
+    php.ini|.user.ini)     return 0 ;;
+  esac
+  return 1
+}
+
+# Compare core against cache JSON (MD5)
+# Prints console summary and writes ONE line to $site_rep:
+#   WORDPRESS_CHECKSUMS=OK|FAIL|PRIVATE|ERR
+_wp_core_compare_from_cache() {
+  local wp_root="$1" ver="$2" loc="$3"
+  local cache="$(_wp_core_cache_file_for "$ver" "$loc")"
+
+  if [[ -z "$cache" ]]; then
+    printf "wordpress core %s %s PRIVATE\n" "$ver" "${loc:-no-locale}"
+    [[ -n "${site_rep:-}" ]] && echo "WORDPRESS_CHECKSUMS=PRIVATE" >> "$site_rep"
+    return 2
+  fi
+
+  if ! command -v jq >/dev/null 2>&1; then
+    printf "wordpress core %s %s ERR(no-jq)\n" "$ver" "${loc:-no-locale}"
+    [[ -n "${site_rep:-}" ]] && echo "WORDPRESS_CHECKSUMS=ERR" >> "$site_rep"
+    return 1
+  fi
+
+  local expected_map expected_list_sorted local_list_sorted miss_list mm_list extra_list
+  expected_map="$(mktemp)"
+  expected_list_sorted="$(mktemp)"
+  local_list_sorted="$(mktemp)"
+  miss_list="$(mktemp)"
+  mm_list="$(mktemp)"
+  extra_list="$(mktemp)"
+
+  if ! _wp_core_cache_to_tsv "$cache" >"$expected_map"; then
+    printf "wordpress core %s %s ERR(bad-json)\n" "$ver" "${loc:-no-locale}"
+    [[ -n "${site_rep:-}" ]] && echo "WORDPRESS_CHECKSUMS=ERR" >> "$site_rep"
+    rm -f "$expected_map" "$expected_list_sorted" "$local_list_sorted" "$miss_list" "$mm_list" "$extra_list"
+    return 1
+  fi
+
+  awk -F'\t' '{print $1}' "$expected_map" | LC_ALL=C sort -u >"$expected_list_sorted"
+
+  pushd "$wp_root" >/dev/null || {
+    printf "wordpress core %s %s ERR(no-wp-root)\n" "$ver" "${loc:-no-locale}"
+    [[ -n "${site_rep:-}" ]] && echo "WORDPRESS_CHECKSUMS=ERR" >> "$site_rep"
+    rm -f "$expected_map" "$expected_list_sorted" "$local_list_sorted" "$miss_list" "$mm_list" "$extra_list"
+    return 1
+  }
+  LC_ALL=C find . -type f -print | sed 's|^\./||' | LC_ALL=C sort -u >"$local_list_sorted"
+
+  local missing=0 mismatched=0 extras=0 rel expected_md5 actual_md5
+  while IFS= read -r rel; do
+    if [[ ! -f "$rel" ]]; then
+      ((missing++)); echo "$rel" >>"$miss_list"
+    else
+      expected_md5="$(awk -F'\t' -v f="$rel" '$1==f{print $2; exit}' "$expected_map")"
+      if [[ -n "$expected_md5" ]]; then
+        actual_md5="$(md5sum -- "$rel" | awk '{print $1}')"
+        if [[ "$actual_md5" != "$expected_md5" ]]; then
+          ((mismatched++)); echo "$rel" >>"$mm_list"
+        fi
+      else
+        ((missing++)); echo "$rel" >>"$miss_list"
+      fi
+    fi
+  done <"$expected_list_sorted"
+
+  while IFS= read -r rel; do
+    if ! grep -Fxq -- "$rel" "$expected_list_sorted"; then
+      if ! _wp_ignore_extra "$rel"; then
+        echo "$rel" >>"$extra_list"; ((extras++))
+      fi
+    fi
+  done <"$local_list_sorted"
+
+  popd >/dev/null || true
+
+  if (( missing==0 && mismatched==0 && extras==0 )); then
+    printf "wordpress core %s %s OK\n" "$ver" "${loc:-no-locale}"
+    [[ -n "${site_rep:-}" ]] && echo "WORDPRESS_CHECKSUMS=OK" >> "$site_rep"
+  else
+    printf "wordpress core %s %s FAIL missing=%d mismatched=%d extra=%d\n" \
+           "$ver" "${loc:-no-locale}" "$missing" "$mismatched" "$extras"
+    [[ -n "${site_rep:-}" ]] && echo "WORDPRESS_CHECKSUMS=FAIL" >> "$site_rep"
+
+    # ECHO details to console (only if non-zero)
+    ((missing))    && { echo "  [wp-core missing]";    sed 's/^/    - /' "$miss_list"; }
+    ((mismatched)) && { echo "  [wp-core mismatched]"; sed 's/^/    - /' "$mm_list"; }
+    ((extras))     && { echo "  [wp-core extra]";      sed 's/^/    - /' "$extra_list"; }
+
+    # LOG details to site_log as well
+    if [[ -n "${site_log:-}" ]]; then
+      {
+        ((missing))    && { echo "  [wp-core missing]";    sed 's/^/    - /' "$miss_list"; }
+        ((mismatched)) && { echo "  [wp-core mismatched]"; sed 's/^/    - /' "$mm_list"; }
+        ((extras))     && { echo "  [wp-core extra]";      sed 's/^/    - /' "$extra_list"; }
+      } >>"$site_log"
+    fi
+  fi
+
+  rm -f "$expected_map" "$expected_list_sorted" "$local_list_sorted" \
+        "$miss_list" "$mm_list" "$extra_list"
+}
+
+#------------------------------------------------------------------------------
+# Public API
+#------------------------------------------------------------------------------
+
+# Usage: wordpress_checksums_site "<site>"
+wordpress_checksums_site() {
+
+  local site="${1:-}"
+  [[ -n "$site" ]] || { echo "wordpress_checksums_site: missing site"; return 1; }
+
+  local arr="${CONFIG_SITES[$site]:-}"
+  [[ -n "$arr" ]] || { echo "wordpress_checksums_site: site not loaded: $site"; return 1; }
+
+  # Pull vars from loaded site map
+  local LOCAL_SYNC_PATH WORDPRESS_CHECKSUMS LOCAL_DOCUMENT_ROOT LOCAL_WEBROOT
+  LOCAL_SYNC_PATH="$(_get "$arr" LOCAL_SYNC_PATH)"
+  WORDPRESS_CHECKSUMS="$(_get "$arr" WORDPRESS_CHECKSUMS)"
+  LOCAL_DOCUMENT_ROOT="$(_get "$arr" LOCAL_DOCUMENT_ROOT)"
+  LOCAL_WEBROOT="${LOCAL_SYNC_PATH}${LOCAL_DOCUMENT_ROOT}"
+
+  local log_dir="logs/${EPOCH_TIMESTAMP}"
+  local rep_dir="reports/${EPOCH_TIMESTAMP}"
+  site_log="${log_dir}/${site}.log"
+  site_rep="${rep_dir}/${site}.report"
+  mkdir -p "$log_dir" "$rep_dir"
+
+  if [[ "${WORDPRESS_CHECKSUMS}" != "y" ]]; then
+    echo "  wordpress checksums ${site} ... [SKIPPED]" | tee -a "$site_log"
+    echo "WORDPRESS_CHECKSUMS=SKIPPED" >> "$site_rep"
+    return 0
+  fi
+
+  local version_php="${LOCAL_WEBROOT%/}/wp-includes/version.php"
+  local wp_version="unknown" wp_locale=""
+  if [[ -r "$version_php" ]]; then
+    wp_version="$(_php_extract_assigned_scalar "$version_php" "wp_version")" || wp_version="unknown"
+    wp_locale="$(_php_extract_assigned_scalar "$version_php" "wp_local_package")" || wp_locale=""
+  fi
+
+  local line
+  line="$(_wp_core_compare_from_cache "$LOCAL_WEBROOT" "$wp_version" "$wp_locale")"
+  echo "$line" | tee -a "$site_log"
+}
+# (EOF)

@@ -2,6 +2,13 @@
 # file : ./midgard
 set -euo pipefail
 export MIDGARD_VERSION="1.0.0"
+export MIDGARD_SCRIPT_PATH="$(dirname "$(realpath "$0")")"
+export MIDGARD_EPOCH_TIMESTAMP="$(date +%s)"
+export MIDGARD_LOG_DIR="${MIDGARD_SCRIPT_PATH}/logs"
+export MIDGARD_REPORT_DIR="${MIDGARD_SCRIPT_PATH}/reports"
+export MIDGARD_SESSION_LOG_DIR="${MIDGARD_LOG_DIR}/${MIDGARD_EPOCH_TIMESTAMP}"
+export MIDGARD_SESSION_REPORT_DIR="${MIDGARD_REPORT_DIR}/${MIDGARD_EPOCH_TIMESTAMP}"
+export MIDGARD_PLUGINS_CHECKSUMS_PATH="${MIDGARD_SCRIPT_PATH}/plugin-checksums"
 #------------------------------------------------------------------------------
 cat <<'EOF'
 
@@ -14,7 +21,8 @@ cat <<'EOF'
 
 EOF
 
-EPOCH_TIMESTAMP="$(date +%s)"
+EPOCH_TIMESTAMP="${MIDGARD_EPOCH_TIMESTAMP}"
+
 
 echo -e " Version : ${MIDGARD_VERSION}\n"
 
@@ -212,10 +220,11 @@ for enabled_site in "${ENABLED_SITES[@]}"; do
   fi
 
   # check plugin checksums
-  if ! plugin_checksums_site "$enabled_site"; then
-    echo "    - plugin checksums core failed for ${enabled_site}";
-  fi
+#  if ! plugin_checksums_main "$enabled_site"; then
+#    echo "    - plugin checksums core failed for ${enabled_site}";
+#  fi
 
+  plugin_checksums_main "$enabled_site" || true
 
   # check wordpress checksums
   if ! wordpress_checksums_site "$enabled_site"; then

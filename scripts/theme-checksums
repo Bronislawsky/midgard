@@ -9,255 +9,325 @@
 # |__|_|  /__\____ |\___  (____  /__|  \____ |
 #       \/        \/_____/     \/           \/
 #
-# theme-checksums
-#   - Uses local cache JSON in ./theme-checksums/<slug>/<version>.json
-#   - (No official auto-fetch for themes; if cache missing -> PRIVATE)
-#   - Compares against local theme files to detect:
-#       * missing files (in JSON but not on disk)
-#       * mismatched hashes (md5 differs)
-#       * extra files (on disk but not in JSON)  <-- potential injections
-#   - Appends overall status to reports/$EPOCH_TIMESTAMP/<site>.report
-#   - Logs detailed differences to logs/$EPOCH_TIMESTAMP/<site>.log
+# theme-checksums — prepare/check theme checksum JSONs for a site
+#
+# - Cache base (no trailing slash):
+#       $MIDGARD_THEMES_CHECKSUMS_PATH/<slug>/<version>.json
+# - If cache miss, generate locally from theme files.
+# - Detect main theme file like WordPress:
+#       * look for style.css in theme dir
+#       * look for "Theme Name:" in first 8192 bytes (comment-safe)
+#       * extract "Version:" from the same header block
+# - If JSON cannot be generated (e.g., disk issues), mark that theme FAIL.
+# - Append per-theme lines to site log; write overall THEME_CHECKSUMS=OK|FAIL
+#
+# NOTE: This prepares inputs. A future step can compare on-disk files vs JSON.
 #------------------------------------------------------------------------------
 
-# Safety guard
+# Safety guard: only usable when sourced by the main launcher
+# This checks if the script is being sourced from the main Midgard launcher by verifying the MIDGARD_MAIN environment variable.
+# If not, it prints an error and exits or returns (for sourcing compatibility).
 if [[ "${MIDGARD_MAIN:-}" != "1" ]]; then
   echo "This script must be sourced from the midgard launcher." >&2
   return 1 2>/dev/null || exit 1
 fi
 
-#------------------------------------------------------------------------------
-# Utilities
-#------------------------------------------------------------------------------
+# Function to generate and cache a theme's checksum JSON file locally.
+# It takes slug, version, base cache directory, and theme directory as arguments.
+# Computes hashes for all files in the theme dir and builds JSON atomically.
+_generate_theme_checksums_file() {
+  local slug="$1"
+  local version="$2"
+  local base_dir="$3"
+  local theme_dir="$4"
 
-# name-ref getter: _get <assoc_array_name> <key>
-_get() {
-  local __arr="$1" __key="$2"
-  declare -n __ref="$__arr"
-  printf '%s' "${__ref[$__key]-}"
-}
-
-#------------------------------------------------------------------------------
-# Version detection (themes)
-#------------------------------------------------------------------------------
-
-# Extract "Version: x.y.z" from style.css header (first ~120 lines).
-_tc_version_from_style() {
-  local css_file="${1:-}"
-  [[ -r "$css_file" ]] || return 0
-  awk 'NR>120{exit}
-       BEGIN{IGNORECASE=1}
-       /^[[:space:]]*(\*|#|\/\/)?[[:space:]]*Version[[:space:]]*:/{
-         sub(/^[[:space:]]*(\*|#|\/\/)?[[:space:]]*Version[[:space:]]*:[[:space:]]*/, "", $0)
-         gsub(/[[:space:]]+$/, "", $0)
-         print $0; exit
-       }' "$css_file"
-}
-
-# Themes commonly keep version only in style.css. Try that; fall back to readme.txt "Stable tag".
-_tc_detect_theme_version() {
-  local theme_dir="${1:-}"
-  local ver f
-
-  f="${theme_dir%/}/style.css"
-  if [[ -f "$f" ]]; then
-    ver="$(_tc_version_from_style "$f")"
-    [[ -n "$ver" ]] && { printf '%s\n' "$ver"; return 0; }
-  fi
-
-  f="${theme_dir%/}/readme.txt"
-  if [[ -f "$f" ]]; then
-    ver="$(
-      awk 'BEGIN{IGNORECASE=1}
-           /^[[:space:]]*Stable[[:space:]]+tag[[:space:]]*:/{
-             sub(/^[[:space:]]*Stable[[:space:]]+tag[[:space:]]*:[[:space:]]*/, "", $0)
-             gsub(/[[:space:]]+$/, "", $0)
-             print $0; exit
-           }' "$f"
-    )"
-    [[ -n "$ver" ]] && { printf '%s\n' "$ver"; return 0; }
-  fi
-
-  printf 'unknown\n'
-}
-
-#------------------------------------------------------------------------------
-# Cache + compare
-#------------------------------------------------------------------------------
-
-# Return path for cache file (does not ensure it exists)
-_tc_cache_path() {
-  local slug="$1" ver="$2"
-  printf './theme-checksums/%s/%s.json\n' "$slug" "$ver"
-}
-
-# Return the path to the cached checksum JSON; no auto-fetch (themes lack an official API)
-_tc_cache_file_for() {
-  local slug="$1" ver="$2"
-  local path="$(_tc_cache_path "$slug" "$ver")"
-  [[ -f "$path" ]] && { printf '%s\n' "$path"; return 0; }
-  return 1
-}
-
-# Compare JSON checksums to on-disk theme files.
-# Prints one summary line; returns:
-#   0 OK
-#   1 FAIL (missing/mismatched/extra or errors)
-#   2 PRIVATE (no cache JSON)
-_tc_compare_from_cache() {
-  local theme_dir="$1" slug="$2" ver="$3"
-  local cache
-  if ! cache="$(_tc_cache_file_for "$slug" "$ver")"; then
-    printf "%s %s PRIVATE\n" "$slug" "$ver"
-    return 2
-  fi
-
-  if ! command -v jq >/dev/null 2>&1; then
-    printf "%s %s ERR(no-jq)\n" "$slug" "$ver"
+  # validate input
+  # Ensures all required parameters are provided; returns failure if any are empty or invalid.
+  if [[ -z "$slug" || -z "$version" || -z "$base_dir" || -z "$theme_dir" || ! -d "$theme_dir" ]]; then
     return 1
   fi
 
-  # temps
-  local expected_list expected_list_sorted expected_map
-  local local_list_sorted miss_list mm_list extra_list
-  expected_list="$(mktemp)"
-  expected_list_sorted="$(mktemp)"
-  expected_map="$(mktemp)"
-  local_list_sorted="$(mktemp)"
-  miss_list="$(mktemp)"
-  mm_list="$(mktemp)"
-  extra_list="$(mktemp)"
+  # Constructs the destination paths in the cache.
+  local dest_dir="${base_dir}/${slug}"
+  local dest_file="${dest_dir}/${version}.json"
 
-  # JSON shape matches your cache (like plugins): top-level {"files": { "path": {"md5": "..."} , ... }}
-  if ! jq -r '.files | keys[]' "$cache" >"$expected_list"; then
-    printf "%s %s ERR(bad-json)\n" "$slug" "$ver"
-    rm -f "$expected_list" "$expected_list_sorted" "$expected_map" \
-          "$local_list_sorted" "$miss_list" "$mm_list" "$extra_list"
-    return 1
-  fi
-  jq -r '.files | to_entries[] | [.key, (.value.md5 // .value // "")] | @tsv' "$cache" >"$expected_map"
-  LC_ALL=C sort -u "$expected_list" >"$expected_list_sorted"
+  # create a secure temp file for building JSON
+  # Uses mktemp to create a unique temporary file in /tmp for safe generation.
+  local tmp_file
+  tmp_file=$(mktemp "/tmp/theme-checksum-${slug}-${version}-XXXXXX.json") || return 1
 
-  # local files (relative to theme dir)
-  pushd "$theme_dir" >/dev/null || {
-    printf "%s %s ERR(no-theme-dir)\n" "$slug" "$ver"
-    rm -f "$expected_list" "$expected_list_sorted" "$expected_map" \
-          "$local_list_sorted" "$miss_list" "$mm_list" "$extra_list"
-    return 1
-  }
-  LC_ALL=C find . -type f -print | sed 's|^\./||' | LC_ALL=C sort -u >"$local_list_sorted"
+  # Initialize empty JSON
+  echo '{"files":{}}' > "$tmp_file" || { rm -f "$tmp_file"; return 1; }
 
-  # Compare
-  local missing=0 mismatched=0 extras=0 file expected_md5 actual_md5
-  while IFS= read -r file; do
-    if [[ ! -f "$file" ]]; then
-      ((missing++)); echo "$file" >>"$miss_list"
+  # Loop over all files in theme_dir, compute hashes, add to JSON
+  # Uses -print0 and read -d '' to handle file paths with spaces.
+  find "$theme_dir" -type f -print0 | while IFS= read -r -d '' file; do
+    local rel_file="${file#"$theme_dir"/}"
+    local md5=$(md5sum "$file" | awk '{print $1}')
+    local sha256=$(sha256sum "$file" | awk '{print $1}')
+    if [[ -n "$md5" && -n "$sha256" ]]; then
+      jq --arg f "$rel_file" --arg m "$md5" --arg s "$sha256" '.files[$f] = {"md5": $m, "sha256": $s}' "$tmp_file" > "${tmp_file}.tmp" || { rm -f "$tmp_file" "${tmp_file}.tmp"; return 1; }
+      mv "${tmp_file}.tmp" "$tmp_file" || { rm -f "$tmp_file" "${tmp_file}.tmp"; return 1; }
     else
-      expected_md5="$(awk -F'\t' -v f="$file" '$1==f{print $2; exit}' "$expected_map")"
-      if [[ -n "$expected_md5" ]]; then
-        actual_md5="$(md5sum -- "$file" | awk '{print $1}')"
-        if [[ "$actual_md5" != "$expected_md5" ]]; then
-          ((mismatched++)); echo "$file" >>"$mm_list"
-        fi
-      else
-        ((missing++)); echo "$file" >>"$miss_list"
-      fi
+      rm -f "$tmp_file" "${tmp_file}.tmp"
+      return 1
     fi
-  done <"$expected_list_sorted"
+  done
 
-  # Extras (local but not expected)
-  LC_ALL=C comm -23 "$local_list_sorted" "$expected_list_sorted" >"$extra_list"
-  extras="$(wc -l <"$extra_list" | awk '{print $1}')"
+  # Move to destination if successful
+  mkdir -p "$dest_dir" || { rm -f "$tmp_file"; return 1; }
+  mv "$tmp_file" "$dest_file" || { rm -f "$tmp_file"; return 1; }
+  return 0
+}
 
-  popd >/dev/null || true
-
-  # Result
-  if (( missing==0 && mismatched==0 && extras==0 )); then
-    printf "%s %s OK\n" "$slug" "$ver"
-    rm -f "$expected_list" "$expected_list_sorted" "$expected_map" \
-          "$local_list_sorted" "$miss_list" "$mm_list" "$extra_list"
-    return 0
-  else
-    printf "%s %s FAIL missing=%d mismatched=%d extra=%d\n" "$slug" "$ver" "$missing" "$mismatched" "$extras"
-    if [[ -n "${site_log:-}" ]]; then
-      {
-        ((missing))    && { echo "  [${slug} missing]";    sed 's/^/    - /' "$miss_list"; }
-        ((mismatched)) && { echo "  [${slug} mismatched]"; sed 's/^/    - /' "$mm_list"; }
-        ((extras))     && { echo "  [${slug} extra]";      sed 's/^/    - /' "$extra_list"; }
-      } >>"$site_log"
-    fi
-    rm -f "$expected_list" "$expected_list_sorted" "$expected_map" \
-          "$local_list_sorted" "$miss_list" "$mm_list" "$extra_list"
+# Helper to get the theme slug from the directory path
+# Extracts the last component of the path (e.g., "twentytwentyfour" from "/path/to/twentytwentyfour")
+# This function derives the theme's slug (unique identifier) from its directory name.
+# Returns empty string and failure code if the directory is invalid or doesn't exist.
+_get_theme_slug() {
+  local theme_dir="$1"
+  if [ -z "$theme_dir" ] || [ ! -d "$theme_dir" ]; then
+    echo ""
     return 1
+  fi
+  basename "$theme_dir"
+  return 0
+}
+
+# Function to get the theme version from the directory
+# Takes the theme directory path as argument and outputs the version
+# This emulates WordPress's theme detection: checks style.css for a header comment block.
+# Looks for "Theme Name:" to confirm, then extracts "Version:" from it.
+# Approximates WP's 8KB limit by checking first 100 lines; uses regex to handle various header formats.
+_get_theme_version() {
+  local theme_dir="$1"
+
+  if [ -z "$theme_dir" ] || [ ! -d "$theme_dir" ]; then
+    echo "null"
+    return 1
+  fi
+
+  local main_file="$theme_dir/style.css"
+  if [ ! -f "$main_file" ] || ! head -n 100 "$main_file" | grep -iqE '^[ \t\/*#@]*Theme Name:'; then
+    echo "null"
+    return 1
+  fi
+
+  local version=$(head -n 100 "$main_file" | grep -iPo '^[ \t\/*#@]*Version:\s*\K[\d.]+')
+
+  if [ -z "$version" ]; then
+    echo "null"
+    return 1
+  else
+    echo "$version"
+    return 0
   fi
 }
 
-#------------------------------------------------------------------------------
-# Public API
-#------------------------------------------------------------------------------
-
-# Usage: theme_checksums_site "<site>"
-theme_checksums_site() {
-
+# Usage: theme_checksums_main "<site>"
+# Main entry point for processing a single site's themes.
+# Takes the site identifier as argument; resolves config, paths, and performs checksum checks.
+theme_checksums_main() {
   local site="${1:-}"
-  [[ -n "$site" ]] || { echo "theme_checksums_site: missing site"; return 1; }
+  if [[ -z "$site" ]]; then
+    echo "theme_checksums_main: missing site" >&2
+    return 1
+  fi
 
-  local arr="${CONFIG_SITES[$site]:-}"
-  [[ -n "$arr" ]] || { echo "theme_checksums_site: site not loaded: $site"; return 1; }
+  # CONFIG_SITES maps site -> name of its assoc array (string)
+  # Retrieves the associative array name for the site's config from global CONFIG_SITES.
+  local assoc_name="${CONFIG_SITES[$site]:-}"
+  if [[ -z "$assoc_name" ]]; then
+    echo "theme_checksums_main: site not loaded: $site" >&2
+    return 1
+  fi
 
-  # Pull vars from loaded site map
-  local LOCAL_SYNC_PATH THEME_CHECKSUMS LOCAL_DOCUMENT_ROOT LOCAL_WEBROOT LOCAL_THEMES_DIR
-  LOCAL_SYNC_PATH="$(_get "$arr" LOCAL_SYNC_PATH)"
-  THEME_CHECKSUMS="$(_get "$arr" THEME_CHECKSUMS)"
-  LOCAL_DOCUMENT_ROOT="$(_get "$arr" LOCAL_DOCUMENT_ROOT)"
-  LOCAL_WEBROOT="${LOCAL_SYNC_PATH}${LOCAL_DOCUMENT_ROOT}"
-  LOCAL_THEMES_DIR="${LOCAL_WEBROOT}/wp-content/themes"
+  # Prepare per-run paths
+  # Creates session log and report directories if needed, and defines site-specific file paths.
+  mkdir -p "${MIDGARD_SESSION_LOG_DIR}" "${MIDGARD_SESSION_REPORT_DIR}"
+  local SITE_LOG_FILE="${MIDGARD_SESSION_LOG_DIR}/${site}.log"
+  local SITE_REPORT_FILE="${MIDGARD_SESSION_REPORT_DIR}/${site}.report"
 
-  local log_dir="logs/${EPOCH_TIMESTAMP}"
-  local rep_dir="reports/${EPOCH_TIMESTAMP}"
-  site_log="${log_dir}/${site}.log"
-  local site_rep="${rep_dir}/${site}.report"
-  mkdir -p "$log_dir" "$rep_dir"
+  # Per-site toggle
+  # Fetches the THEME_CHECKSUMS toggle from the site's config array.
+  local THEME_CHECKSUMS="$(midgard_get_value_from_array "$assoc_name" THEME_CHECKSUMS)"
 
   # Respect per-site toggle
-  if [[ "${THEME_CHECKSUMS}" != "y" ]]; then
-    echo "  theme checksums ${site} ... [SKIPPED]" | tee -a "$site_log"
-    echo "THEME_CHECKSUMS=SKIPPED" >> "$site_rep"
+  # Prints a timestamped status to console for the theme checksums process.
+  echo -en "$(midgard_current_time) ${site}"
+  echo -en "  Theme checksums... "
+  if [[ "$THEME_CHECKSUMS" != "y" ]]; then
+    # Plain log to SITE_LOG_FILE
+    # If disabled, outputs colored [DISABLED] to console, logs it plainly to file, writes SKIPPED to report, and exits successfully.
+    echo -e "${c_light_blue}[${c_light_red}DISABLED${c_light_blue}]${c_reset}"
+    echo "$(midgard_current_time)  Theme Checksums... [DISABLED]" >> "${SITE_LOG_FILE}"
+    echo "THEME_CHECKSUMS=SKIPPED" >> "${SITE_REPORT_FILE}"
     return 0
   fi
 
-  [[ -d "$LOCAL_THEMES_DIR" ]] || {
-    echo "  theme checksums ${site} ... [NO THEMES]" | tee -a "$site_log"
-    echo "THEME_CHECKSUMS=NO_THEMES" >> "$site_rep"
-    return 0
-  }
+  # If enabled, outputs colored [ENABLED] to console and logs it to file.
+  echo -e "${c_light_blue}[${c_green}ENABLED${c_light_blue}]${c_reset}"
+  echo "$(midgard_current_time)  Theme Checksums... [ENABLED]" >> "${SITE_LOG_FILE}"
 
-  local rc_all=0
-  shopt -s nullglob
-  local d slug ver line rc
-  for d in "$LOCAL_THEMES_DIR"/*/; do
-    [[ -d "$d" ]] || continue
-    slug="$(basename "${d%/}")"
-    [[ "$slug" == .* ]] && continue
+  # Resolve site paths
+  # Constructs full paths to the site's themes directory using config values.
+  local SITE_SYNC_PATH SITE_DOCUMENT_ROOT_PATH SITE_WEB_ROOT_PATH SITE_THEMES_PATH
+  SITE_SYNC_PATH="$(midgard_get_value_from_array "$assoc_name" LOCAL_SYNC_PATH)"
+  SITE_DOCUMENT_ROOT_PATH="$(midgard_get_value_from_array "$assoc_name" LOCAL_DOCUMENT_ROOT)"
+  SITE_WEB_ROOT_PATH="${SITE_SYNC_PATH}${SITE_DOCUMENT_ROOT_PATH}"
+  SITE_THEMES_PATH="${SITE_WEB_ROOT_PATH}/wp-content/themes"
 
-    ver="$(_tc_detect_theme_version "$d")"
-    if [[ "$ver" == "unknown" || -z "$ver" ]]; then
-      line="${slug} unknown FAIL version"
-      echo "$line" | tee -a "$site_log"
-      rc_all=1
+  # Count failed checksum verification
+  # Initializes a flag (not a true counter) for any failures during processing.
+  local checksum_fail=0
+
+  # Loops over each subdirectory in the themes path (assumes each is a theme).
+  for theme_dir in "$SITE_THEMES_PATH"/*; do
+    [[ -d "$theme_dir" ]] || continue
+
+    # Retrieves slug and version using helpers; may return "null" on failure.
+    local theme_slug=$(_get_theme_slug "$theme_dir");
+    local theme_version=$(_get_theme_version "$theme_dir");
+
+    # If slug retrieval failed (unlikely, as it's just basename), logs error, sets fail flag, and skips.
+    if [[ "$theme_slug" == "null" ]]; then
+        echo -e "$(midgard_current_time) ${site}    ${c_light_red}Could not determine the theme slug${c_reset}"
+        echo "$(midgard_current_time)     Could not determine the theme slug" >> "${SITE_LOG_FILE}"
+        checksum_fail=1
+        continue
+    fi
+
+    # If version retrieval failed (e.g., no valid header), logs error, sets fail flag, and skips.
+    if [[ "$theme_version" == "null" ]]; then
+        echo -e "$(midgard_current_time) ${site}    ${c_light_red}Could not determine the version of ${theme_slug}${c_reset}"
+        echo "$(midgard_current_time)     Could not determine the version of ${theme_slug}" >> "${SITE_LOG_FILE}"
+        checksum_fail=1
+        continue
+    fi
+
+    # Logs the start of checksum check for this theme.
+    echo -e "$(midgard_current_time) ${site}    Checksum integrity check for ${c_yellow}${theme_slug}${c_reset} version ${c_yellow}${theme_version}${c_reset}"
+    echo "$(midgard_current_time)     Checksum integrity check for ${theme_slug} version ${theme_version}" >> "${SITE_LOG_FILE}"
+
+    # Constructs path to cached JSON checksum file.
+    json_checksum_file="${MIDGARD_THEMES_CHECKSUMS_PATH}/${theme_slug}/${theme_version}.json"
+
+    if [[ ! -f "$json_checksum_file" ]]; then
+      # If not in cache, logs miss and attempts to generate.
+      echo -e "$(midgard_current_time) ${site}      JSON checksum file ${c_light_red}NOT${c_reset} found in cache : ${c_light_blue}${theme_slug}/${theme_version}.json${c_reset}"
+      echo "$(midgard_current_time)       JSON checksum file NOT found in cache : ${theme_slug}/${theme_version}.json" >> "${SITE_LOG_FILE}"
+
+      # Temporarily disables errexit for generate (to handle failure gracefully).
+      set +e
+      _generate_theme_checksums_file "${theme_slug}" "${theme_version}" "${MIDGARD_THEMES_CHECKSUMS_PATH}" "${theme_dir}"
+      local ret=$?
+      set -e
+
+      # If generate failed (e.g., disk issue), logs failure, sets flag, skips.
+      if [[ $ret -ne 0 ]]; then
+        echo -e "$(midgard_current_time) ${site}      ${c_light_red}FAILED${c_reset} to generate theme checksums file"
+        echo "$(midgard_current_time) ${site}      FAILED to generate theme checksums file" >> "${SITE_LOG_FILE}"
+        checksum_fail=1
+        continue
+      else
+        # Logs success if generated.
+        echo -e "$(midgard_current_time) ${site}      ${c_light_green}SUCCESS${c_reset} generating theme checksums file"
+        echo "$(midgard_current_time) ${site}      SUCCESS generating theme checksums file" >> "${SITE_LOG_FILE}"
+      fi
+
+    fi
+
+    # Creates temp files for listing JSON keys (expected files) and local files.
+    local json_file_list=$(mktemp)
+    local local_file_list=$(mktemp)
+    # Extracts file paths from JSON using jq; sorts uniquely.
+    # If jq fails (e.g., invalid JSON), logs error, cleans partial temp, sets flag, skips.
+    if ! jq -r '.files | keys[]' "$json_checksum_file" 2>/dev/null | LC_ALL=C sort -u >"$json_file_list"; then
+      echo -e "$(midgard_current_time) ${site}      ${c_light_red}FAILED${c_reset} to parse JSON"
+      echo "$(midgard_current_time) ${site}      FAILED to parse JSON" >> "${SITE_LOG_FILE}"
+      rm -f "$json_file_list"
+      checksum_fail=1
       continue
     fi
 
-    line="$(_tc_compare_from_cache "$d" "$slug" "$ver")"
-    rc=$?
-    echo "$line" | tee -a "$site_log"
-    [[ $rc -eq 1 ]] && rc_all=1
+    # Enumerates relative paths of all files in theme dir using find; sorts uniquely.
+    # If fails (e.g., permissions), logs error, cleans temps, sets flag, skips.
+    if ! ( cd "$theme_dir" && find . -type f -printf '%P\n' | LC_ALL=C sort -u >"$local_file_list" ); then
+      echo -e "$(midgard_current_time) ${site}      ${c_light_red}FAILED${c_reset} to enumerate local theme files"
+      echo "$(midgard_current_time) ${site}      FAILED to enumerate local theme files"  >> "${SITE_LOG_FILE}"
+      rm -f "$json_file_list" "$local_file_list"
+      checksum_fail=1
+      continue
+    fi
+
+    # Always sort both lists first!
+    # Ensures lists are sorted and unique for accurate comparison with comm.
+    sort -u "$json_file_list" -o "$json_file_list"
+    sort -u "$local_file_list" -o "$local_file_list"
+
+    # Show files in JSON but not on disk
+    # Uses comm to find missing files (in JSON but not local); logs each, sets flag if any.
+    comm -23 "$json_file_list" "$local_file_list" | while read -r missing; do
+      if [ -n "$missing" ]; then
+        echo -e "$(midgard_current_time) ${site}      ${c_light_red}MISSING${c_reset} file ${c_light_blue}${missing}${c_reset}"
+        echo "$(midgard_current_time) ${site}      MISSING file ${missing}" >> "${SITE_LOG_FILE}"
+        checksum_fail=1
+      fi
+    done
+
+    # Show files on disk but not in JSON
+    # Uses comm to find extra files (in local but not JSON); logs each, sets flag if any.
+    comm -13 "$json_file_list" "$local_file_list" | while read -r extra; do
+      if [ -n "$extra" ]; then
+        echo -e "$(midgard_current_time) ${site}      ${c_light_red}FOUND${c_reset} unexpected file ${c_light_blue}${extra}${c_reset}"
+        echo "$(midgard_current_time) ${site}      FOUND unexpected file ${extra}" >> "${SITE_LOG_FILE}"
+        checksum_fail=1
+      fi
+    done
+
+    # Processes each file's hashes from JSON (file md5 sha256 format).
+    # Computes local sha256, compares; logs mismatch if different, sets flag.
+    # Sets flag silently if file missing or hashes empty (already handled by file lists).
+    while IFS=$'\t' read -r file md5 sha256; do
+      local local_file="${theme_dir}/${file}"
+      if [[ -f "$local_file" ]]; then
+        local local_sha256=$(sha256sum "$local_file" | awk '{print $1}')
+        if [[ -n "$local_sha256" && -n "$sha256" ]]; then
+          if [[ "$local_sha256" != "$sha256" ]]; then
+            echo -e "$(midgard_current_time) ${site}      ${c_light_red}CHECKSUM MISMATCH${c_reset} for ${c_light_blue}${file}${c_reset}"
+            echo "$(midgard_current_time) ${site}      CHECKSUM MISMATCH for ${file}" >> "${SITE_LOG_FILE}"
+            checksum_fail=1
+          fi
+        else
+          # Silently fail as we already enumerate missing files
+          checksum_fail=1
+        fi
+      else
+        # Silently fail as we already enumerate missing files
+        checksum_fail=1
+      fi
+    done < <(jq -r '.files | to_entries[] | [.key, .value.md5, .value.sha256] | join("\t")' "$json_checksum_file")
+
+    # Clean up temp files after checks for this theme
+    rm -f "$json_file_list" "$local_file_list"
+
   done
 
-  if [[ $rc_all -eq 0 ]]; then
-    echo "THEME_CHECKSUMS=OK" >> "$site_rep"
-  else
-    echo "THEME_CHECKSUMS=FAIL" >> "$site_rep"
+  # Outputs final status to console and log file based on whether any failures occurred.
+  echo -en "$(midgard_current_time) ${site}"
+  echo -en "  Theme checksums... "
+  echo -n "$(midgard_current_time)   Theme checksums... " >> "${SITE_LOG_FILE}"
+
+  if [[ ${checksum_fail:-0} -eq 0 ]]; then
+    echo -e "${c_light_blue}[${c_green}SUCCESS${c_light_blue}]${c_reset}"
+    echo "[SUCCESS]" >> "${SITE_LOG_FILE}"
+    echo "THEME_CHECKSUMS=OK" >> "${SITE_REPORT_FILE}"
+    return 0
   fi
+
+  echo -e "${c_light_blue}[${c_light_red}FAILED${c_light_blue}]${c_reset}"
+  echo "[FAILED]" >> "${SITE_LOG_FILE}"
+  echo "THEME_CHECKSUMS=FAIL" >> "${SITE_REPORT_FILE}"
+  return 1
+
 }
-# (EOF)

@@ -9,6 +9,7 @@ export MIDGARD_REPORT_DIR="${MIDGARD_SCRIPT_PATH}/reports"
 export MIDGARD_SESSION_LOG_DIR="${MIDGARD_LOG_DIR}/${MIDGARD_EPOCH_TIMESTAMP}"
 export MIDGARD_SESSION_REPORT_DIR="${MIDGARD_REPORT_DIR}/${MIDGARD_EPOCH_TIMESTAMP}"
 export MIDGARD_PLUGINS_CHECKSUMS_PATH="${MIDGARD_SCRIPT_PATH}/plugin-checksums"
+export MIDGARD_THEMES_CHECKSUMS_PATH="${MIDGARD_SCRIPT_PATH}/theme-checksums"
 #------------------------------------------------------------------------------
 cat <<'EOF'
 
@@ -214,16 +215,7 @@ for enabled_site in "${ENABLED_SITES[@]}"; do
     echo "    - scan for uploads php failed for ${enabled_site}";
   fi
 
-  # check plugin checksums
-  if ! theme_checksums_site "$enabled_site"; then
-    echo "    - theme checksums core failed for ${enabled_site}";
-  fi
-
-  # check plugin checksums
-#  if ! plugin_checksums_main "$enabled_site"; then
-#    echo "    - plugin checksums core failed for ${enabled_site}";
-#  fi
-
+  theme_checksums_main "$enabled_site" || true
   plugin_checksums_main "$enabled_site" || true
 
   # check wordpress checksums

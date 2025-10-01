@@ -9,44 +9,28 @@
 # |__|_|  /__\____ |\___  (____  /__|  \____ |
 #       \/        \/_____/     \/           \/
 #
-# wordpress-checksums
-#   - Uses local cache JSON in ./wordpress-checksums/<version>[-<locale>].json
-#   - Compares core files to detect: missing / mismatched / extra
-#   - Skips plugins & themes, plus configurable extra ignore paths (relative)
-#   - When any differences exist, ECHO and LOG the missing/mismatched/extra lists
-#   - Writes ONE summary line to reports/$EPOCH_TIMESTAMP/<site>.report
+# wordpress-checksums — prepare/check WordPress core checksum JSON for a site
+#
+# - Cache base (no trailing slash):
+#       $MIDGARD_WORDPRESS_CHECKSUMS_PATH/<version>[-<locale>].json
+# - If cache miss, fail (no online fetch).
+# - Detect WP version and locale from wp-includes/version.php.
+# - If JSON missing (e.g., unknown version), mark as FAIL.
+# - Append lines to site log; write overall WORDPRESS_CHECKSUMS=OK|FAIL
+#
+# NOTE: This checks core integrity. Ignores only wp-content/uploads for extras to follow user directive,
+# but keeps standard ignores for plugins/themes/wp-config/etc. to avoid false positives on expected files.
+# Filters out plugins/themes paths from JSON to avoid flagging them as missing/mismatched (scanned separately).
+# Scans wp-content/languages/*.php for malicious code; ignores only if clean.
 #------------------------------------------------------------------------------
 
-# Safety guard
+# Safety guard: only usable when sourced by the main launcher
 if [[ "${MIDGARD_MAIN:-}" != "1" ]]; then
   echo "This script must be sourced from the midgard launcher." >&2
   return 1 2>/dev/null || exit 1
 fi
 
-#------------------------------------------------------------------------------
-# Configurable ignore list (relative to webroot) for "extra" detection
-#------------------------------------------------------------------------------
-IGNORE_PATH=(
-  "wp-content/cache"
-  "wp-content/et-cache"
-  "wp-content/uploads"
-  "wp-content/wp-rocket-config"
-  "wp-content/wflogs"
-  "wp-content/languages"
-)
-
-#------------------------------------------------------------------------------
-# Utilities
-#------------------------------------------------------------------------------
-
-# name-ref getter: _get <assoc_array_name> <key>
-_get() {
-  local __arr="$1" __key="$2"
-  declare -n __ref="$__arr"
-  printf '%s' "${__ref[$__key]-}"
-}
-
-# Extract quoted scalar assigned in version.php:
+# Extract quoted scalar assigned in version.php
 _php_extract_assigned_scalar() {
   local file="$1" varname="$2"
   [[ -r "$file" ]] || return 1
@@ -66,220 +50,311 @@ _php_extract_assigned_scalar() {
   ' "$file"
 }
 
-# Prefer version-locale.json if locale present & exists, else version.json
-_wp_core_cache_file_for() {
-  local ver="$1" loc="$2"
-  local base="./wordpress-checksums"
-  if [[ -n "$loc" && -f "${base}/${ver}-${loc}.json" ]]; then
-    printf '%s\n' "${base}/${ver}-${loc}.json"; return 0
+# Check if a file contains common malicious patterns
+# Returns 0 if suspicious (found patterns), 1 if clean, and logs matched patterns
+_is_suspicious() {
+  local file="$1"
+  local patterns="\\b(eval|base64_decode|gzinflate|str_rot13|shell_exec|exec|system|passthru|popen|proc_open|hex2bin|unserialize)(\\(|\\s+\\()"
+  local found_patterns
+
+  # Pre-process the file to remove comments and quoted strings
+  local cleaned_file
+  cleaned_file=$(mktemp) || return 1
+  sed -e 's/\/\/.*//g' -e 's/#.*//g' -e "s/'[^']*'//g" -e 's/"[^"]*"//g' "$file" > "$cleaned_file" || {
+    rm -f "$cleaned_file"
+    return 1
+  }
+
+  # Capture matching lines with patterns from cleaned file
+  found_patterns=$(grep -n -Ei "$patterns" "$cleaned_file" 2>/dev/null)
+  rm -f "$cleaned_file"  # Clean up temp file
+
+  if [[ -n "$found_patterns" ]]; then
+    # Log from original file for accurate context
+    found_patterns=$(grep -n -Ei "$patterns" "$file" 2>/dev/null)
+    echo -e "$(midgard_current_time) ${site}      Suspicious patterns found in ${c_light_blue}${file}${c_reset}:"
+    echo "$found_patterns" | while IFS= read -r line; do
+      echo -e "$(midgard_current_time) ${site}        ${c_light_red}${line}${c_reset}"
+      echo "$(midgard_current_time) ${site}        ${line}" >> "${SITE_LOG_FILE}"
+    done
+    return 0  # Suspicious
   fi
-  [[ -f "${base}/${ver}.json" ]] && printf '%s\n' "${base}/${ver}.json"
-}
-
-# Convert cache JSON to TSV "<path>\t<md5>", normalizing paths and
-# **excluding** wp-content/plugins/** and wp-content/themes/**
-_wp_core_cache_to_tsv() {
-  local cache="$1"
-  jq -r '
-    def norm($p):
-      ($p
-        | gsub("^\\./"; "")
-        | gsub("^wordpress/"; "")
-      );
-
-    def keep($p):
-      ( ($p | startswith("wp-content/plugins/"))
-        or ($p | startswith("wp-content/themes/")) ) | not;
-
-    if has("files") then
-      .files
-      | to_entries[]
-      | .key as $k
-      | [ norm($k), ( .value.md5 // .value // "" ) ]
-      | select( keep(.[0]) and (.[0] != "") and (.[1] != "") )
-      | @tsv
-    elif has("checksums") then
-      .checksums
-      | to_entries[]
-      | .key as $k
-      | [ norm($k), .value ]
-      | select( keep(.[0]) and (.[0] != "") and (.[1] != "") )
-      | @tsv
-    elif type == "object" then
-      to_entries[]
-      | .key as $k
-      | [ norm($k), ( .value.md5 // .value // "" ) ]
-      | select( keep(.[0]) and (.[0] != "") and (.[1] != "") )
-      | @tsv
-    elif type == "array" then
-      .[]
-      | [ norm(.path // .file // .name // ""), ( .md5 // .hash // "" ) ]
-      | select( keep(.[0]) and (.[0] != "") and (.[1] != "") )
-      | @tsv
-    else
-      empty
-    end
-  ' "$cache"
+  return 1  # Clean
 }
 
 # Should a local file (relative) be ignored as an "extra"?
 _wp_ignore_extra() {
-  local rel="$1" i
-  for i in "${IGNORE_PATH[@]}"; do
-    case "$rel" in
-      ${i}/*|${i}) return 0 ;;
-    esac
-  done
+  local rel="$1"
+
+  # ---------- helpers ----------
+  _sha256_file() {
+    # echo the sha256 of "$1" or empty if failed
+    local f="$1" out=""
+    if command -v sha256sum >/dev/null 2>&1; then
+      out="$(sha256sum -b -- "$f" 2>/dev/null | awk '{print $1}')"
+    elif command -v shasum >/dev/null 2>&1; then
+      out="$(shasum -a 256 -- "$f" 2>/dev/null | awk '{print $1}')"
+    elif command -v openssl >/dev/null 2>&1; then
+      # openssl outputs "SHA256(filename)= <hash>" or "<hash> *filename" depending on flags
+      out="$(openssl dgst -sha256 -r -- "$f" 2>/dev/null | awk '{print $1}')"
+    fi
+    printf '%s' "${out}"
+  }
+
+  # ---------- build IGNORE_PATHS from WORDPRESS_CHECKSUMS_IGNORE_PATH ----------
+  local -a IGNORE_PATHS=()
+  if declare -p WORDPRESS_CHECKSUMS_IGNORE_PATH &>/dev/null; then
+    if [[ "$(declare -p WORDPRESS_CHECKSUMS_IGNORE_PATH 2>/dev/null)" == "declare -a"* ]]; then
+      IGNORE_PATHS=("${WORDPRESS_CHECKSUMS_IGNORE_PATH[@]}")
+    else
+      while IFS= read -r line; do
+        line="${line#"${line%%[![:space:]]*}"}"
+        line="${line%"${line##*[![:space:]]}"}"
+        [[ -z "$line" || "$line" == \#* ]] && continue
+        IGNORE_PATHS+=("$line")
+      done <<< "${WORDPRESS_CHECKSUMS_IGNORE_PATH}"
+    fi
+  fi
+
+  # ---------- quick exits for well-known writable content ----------
   case "$rel" in
-    wp-content/plugins/*)  return 0 ;;
-    wp-content/themes/*)   return 0 ;;
-    wp-config.php)         return 0 ;;
-    .htaccess|web.config)  return 0 ;;
-    robots.txt)            return 0 ;;
-    php.ini|.user.ini)     return 0 ;;
+    wp-content/uploads/*)        return 0 ;;
+    wp-content/plugins/*)        return 0 ;;
+    wp-content/themes/*)         return 0 ;;
+    wp-content/languages/*.mo)   return 0 ;;
+    wp-content/languages/*.po)   return 0 ;;
+    wp-content/languages/*.json) return 0 ;;
   esac
+
+  # ---------- languages/*.php => scan; ignore only if clean ----------
+  case "$rel" in
+    wp-content/languages/*.php)
+      if _is_suspicious "${SITE_WEB_ROOT_PATH}/${rel}"; then
+        return 1
+      else
+        echo -e "$(midgard_current_time) ${site}      ${c_yellow}SCANNED${c_reset} ${c_light_blue}${rel}${c_reset} ${c_green}appears OK${c_reset}"
+        echo "$(midgard_current_time) ${site}      Scanned ${rel} and appears OK" >> "${SITE_LOG_FILE}"
+        return 0
+      fi
+      ;;
+  esac
+
+  # ---------- dangerous extension check ----------
+  local is_dangerous=0
+  case "$rel" in
+    *.php|*.phtml|*.phps|*.php[0-9]|*.phar|*.cgi|*.pl|*.sh) is_dangerous=1 ;;
+  esac
+
+  # ---------- inside configured ignore paths? ----------
+  if ((${#IGNORE_PATHS[@]})); then
+    local base
+    for base in "${IGNORE_PATHS[@]}"; do
+      [[ -z "$base" ]] && continue
+      case "$rel" in
+        "$base"|"$base"/*)
+          if (( is_dangerous )); then
+            if _is_suspicious "${SITE_WEB_ROOT_PATH}/${rel}"; then
+              return 1
+            else
+              echo -e "$(midgard_current_time) ${site}      ${c_yellow}SCANNED${c_reset} ${c_light_blue}${rel}${c_reset} ${c_green}appears OK${c_reset}"
+              echo "$(midgard_current_time) ${site}      Scanned ${rel} and appears OK" >> "${SITE_LOG_FILE}"
+              return 0
+            fi
+          else
+            return 0   # silently ignore non-executable inside ignore paths
+          fi
+          ;;
+      esac
+    done
+  fi
+
+  # ---------- EXPECTED "unexpected" files with fixed SHA256 ----------
+  # WORDPRESS_CHECKSUMS_UNEXPECTED_FILES is multi-line "path:sha256"
+  # Example:
+  # .htaccess:2e8e50...
+  # wp-config.php:82b585...
+  # wp-content/advanced-cache.php:beed07...
+  if [[ -n "${WORDPRESS_CHECKSUMS_UNEXPECTED_FILES:-}" ]]; then
+    local kv line k v
+    while IFS= read -r line; do
+      # trim and skip blanks/comments
+      line="${line#"${line%%[![:space:]]*}"}"
+      line="${line%"${line##*[![:space:]]}"}"
+      [[ -z "$line" || "$line" == \#* ]] && continue
+
+      # split "path:hash" — only first ':' splits the key
+      k="${line%%:*}"
+      v="${line#*:}"
+
+      # trim again in case of spaces
+      k="${k#"${k%%[![:space:]]*}"}"; k="${k%"${k##*[![:space:]]}"}"
+      v="${v#"${v%%[![:space:]]*}"}"; v="${v%"${v##*[![:space:]]}"}"
+
+      if [[ "$rel" == "$k" ]]; then
+        # If listed, verify SHA256
+        local file_abs="${SITE_WEB_ROOT_PATH}/${rel}"
+        if [[ -f "$file_abs" ]]; then
+          local have
+          have="$(_sha256_file "$file_abs")"
+          if [[ -n "$have" && -n "$v" && "$have" == "$v" ]]; then
+            echo -e "$(midgard_current_time) ${site}      ${c_cyan}VERIFIED${c_reset} ${c_light_blue}${rel}${c_reset} sha256=${c_green}${have:0:12}…${c_reset}"
+            echo "$(midgard_current_time) ${site}      Verified ${rel} sha256=$have" >> "${SITE_LOG_FILE}"
+            return 0   # accept + ignore
+          else
+            # mismatch or could not compute — do NOT ignore
+            echo -e "$(midgard_current_time) ${site}      ${c_red}DIGEST MISMATCH${c_reset} ${c_light_blue}${rel}${c_reset} expected=${v:0:12}… got=${have:0:12}…"
+            echo "$(midgard_current_time) ${site}      Digest mismatch for ${rel} expected=${v} got=${have}" >> "${SITE_LOG_FILE}"
+            return 1
+          fi
+        else
+          # listed but file missing — still unexpected; let caller handle
+          return 1
+        fi
+      fi
+    done <<< "${WORDPRESS_CHECKSUMS_UNEXPECTED_FILES}"
+  fi
+
+  # Default: do NOT ignore (caller will treat as unexpected/extra)
   return 1
 }
 
-# Compare core against cache JSON (MD5)
-# Prints console summary and writes ONE line to $site_rep:
-#   WORDPRESS_CHECKSUMS=OK|FAIL|PRIVATE|ERR
-_wp_core_compare_from_cache() {
-  local wp_root="$1" ver="$2" loc="$3"
-  local cache="$(_wp_core_cache_file_for "$ver" "$loc")"
-
-  if [[ -z "$cache" ]]; then
-    printf "wordpress core %s %s PRIVATE\n" "$ver" "${loc:-no-locale}"
-    [[ -n "${site_rep:-}" ]] && echo "WORDPRESS_CHECKSUMS=PRIVATE" >> "$site_rep"
-    return 2
-  fi
-
-  if ! command -v jq >/dev/null 2>&1; then
-    printf "wordpress core %s %s ERR(no-jq)\n" "$ver" "${loc:-no-locale}"
-    [[ -n "${site_rep:-}" ]] && echo "WORDPRESS_CHECKSUMS=ERR" >> "$site_rep"
-    return 1
-  fi
-
-  local expected_map expected_list_sorted local_list_sorted miss_list mm_list extra_list
-  expected_map="$(mktemp)"
-  expected_list_sorted="$(mktemp)"
-  local_list_sorted="$(mktemp)"
-  miss_list="$(mktemp)"
-  mm_list="$(mktemp)"
-  extra_list="$(mktemp)"
-
-  if ! _wp_core_cache_to_tsv "$cache" >"$expected_map"; then
-    printf "wordpress core %s %s ERR(bad-json)\n" "$ver" "${loc:-no-locale}"
-    [[ -n "${site_rep:-}" ]] && echo "WORDPRESS_CHECKSUMS=ERR" >> "$site_rep"
-    rm -f "$expected_map" "$expected_list_sorted" "$local_list_sorted" "$miss_list" "$mm_list" "$extra_list"
-    return 1
-  fi
-
-  awk -F'\t' '{print $1}' "$expected_map" | LC_ALL=C sort -u >"$expected_list_sorted"
-
-  pushd "$wp_root" >/dev/null || {
-    printf "wordpress core %s %s ERR(no-wp-root)\n" "$ver" "${loc:-no-locale}"
-    [[ -n "${site_rep:-}" ]] && echo "WORDPRESS_CHECKSUMS=ERR" >> "$site_rep"
-    rm -f "$expected_map" "$expected_list_sorted" "$local_list_sorted" "$miss_list" "$mm_list" "$extra_list"
-    return 1
-  }
-  LC_ALL=C find . -type f -print | sed 's|^\./||' | LC_ALL=C sort -u >"$local_list_sorted"
-
-  local missing=0 mismatched=0 extras=0 rel expected_md5 actual_md5
-  while IFS= read -r rel; do
-    if [[ ! -f "$rel" ]]; then
-      ((missing++)); echo "$rel" >>"$miss_list"
-    else
-      expected_md5="$(awk -F'\t' -v f="$rel" '$1==f{print $2; exit}' "$expected_map")"
-      if [[ -n "$expected_md5" ]]; then
-        actual_md5="$(md5sum -- "$rel" | awk '{print $1}')"
-        if [[ "$actual_md5" != "$expected_md5" ]]; then
-          ((mismatched++)); echo "$rel" >>"$mm_list"
-        fi
-      else
-        ((missing++)); echo "$rel" >>"$miss_list"
-      fi
-    fi
-  done <"$expected_list_sorted"
-
-  while IFS= read -r rel; do
-    if ! grep -Fxq -- "$rel" "$expected_list_sorted"; then
-      if ! _wp_ignore_extra "$rel"; then
-        echo "$rel" >>"$extra_list"; ((extras++))
-      fi
-    fi
-  done <"$local_list_sorted"
-
-  popd >/dev/null || true
-
-  if (( missing==0 && mismatched==0 && extras==0 )); then
-    printf "wordpress core %s %s OK\n" "$ver" "${loc:-no-locale}"
-    [[ -n "${site_rep:-}" ]] && echo "WORDPRESS_CHECKSUMS=OK" >> "$site_rep"
-  else
-    printf "wordpress core %s %s FAIL missing=%d mismatched=%d extra=%d\n" \
-           "$ver" "${loc:-no-locale}" "$missing" "$mismatched" "$extras"
-    [[ -n "${site_rep:-}" ]] && echo "WORDPRESS_CHECKSUMS=FAIL" >> "$site_rep"
-
-    # ECHO details to console (only if non-zero)
-    ((missing))    && { echo "  [wp-core missing]";    sed 's/^/    - /' "$miss_list"; }
-    ((mismatched)) && { echo "  [wp-core mismatched]"; sed 's/^/    - /' "$mm_list"; }
-    ((extras))     && { echo "  [wp-core extra]";      sed 's/^/    - /' "$extra_list"; }
-
-    # LOG details to site_log as well
-    if [[ -n "${site_log:-}" ]]; then
-      {
-        ((missing))    && { echo "  [wp-core missing]";    sed 's/^/    - /' "$miss_list"; }
-        ((mismatched)) && { echo "  [wp-core mismatched]"; sed 's/^/    - /' "$mm_list"; }
-        ((extras))     && { echo "  [wp-core extra]";      sed 's/^/    - /' "$extra_list"; }
-      } >>"$site_log"
-    fi
-  fi
-
-  rm -f "$expected_map" "$expected_list_sorted" "$local_list_sorted" \
-        "$miss_list" "$mm_list" "$extra_list"
-}
-
-#------------------------------------------------------------------------------
-# Public API
-#------------------------------------------------------------------------------
-
-# Usage: wordpress_checksums_site "<site>"
-wordpress_checksums_site() {
-
+# Usage: wordpress_checksums_main "<site>"
+wordpress_checksums_main() {
   local site="${1:-}"
-  [[ -n "$site" ]] || { echo "wordpress_checksums_site: missing site"; return 1; }
+  if [[ -z "$site" ]]; then
+    echo "wordpress_checksums_main: missing site" >&2
+    return 1
+  fi
 
-  local arr="${CONFIG_SITES[$site]:-}"
-  [[ -n "$arr" ]] || { echo "wordpress_checksums_site: site not loaded: $site"; return 1; }
+  local assoc_name="${CONFIG_SITES[$site]:-}"
+  if [[ -z "$assoc_name" ]]; then
+    echo "wordpress_checksums_main: site not loaded: $site" >&2
+    return 1
+  fi
 
-  # Pull vars from loaded site map
-  local LOCAL_SYNC_PATH WORDPRESS_CHECKSUMS LOCAL_DOCUMENT_ROOT LOCAL_WEBROOT
-  LOCAL_SYNC_PATH="$(_get "$arr" LOCAL_SYNC_PATH)"
-  WORDPRESS_CHECKSUMS="$(_get "$arr" WORDPRESS_CHECKSUMS)"
-  LOCAL_DOCUMENT_ROOT="$(_get "$arr" LOCAL_DOCUMENT_ROOT)"
-  LOCAL_WEBROOT="${LOCAL_SYNC_PATH}${LOCAL_DOCUMENT_ROOT}"
+  mkdir -p "${MIDGARD_SESSION_LOG_DIR}" "${MIDGARD_SESSION_REPORT_DIR}"
+  local SITE_LOG_FILE="${MIDGARD_SESSION_LOG_DIR}/${site}.log"
+  local SITE_REPORT_FILE="${MIDGARD_SESSION_REPORT_DIR}/${site}.report"
 
-  local log_dir="logs/${EPOCH_TIMESTAMP}"
-  local rep_dir="reports/${EPOCH_TIMESTAMP}"
-  site_log="${log_dir}/${site}.log"
-  site_rep="${rep_dir}/${site}.report"
-  mkdir -p "$log_dir" "$rep_dir"
+  local WORDPRESS_CHECKSUMS="$(midgard_get_value_from_array "$assoc_name" WORDPRESS_CHECKSUMS)"
+  local WORDPRESS_CHECKSUMS_IGNORE_PATH="$(midgard_get_value_from_array "$assoc_name" WORDPRESS_CHECKSUMS_IGNORE_PATH)"
+  local WORDPRESS_CHECKSUMS_UNEXPECTED_FILES="$(midgard_get_value_from_array "$assoc_name" WORDPRESS_CHECKSUMS_UNEXPECTED_FILES)"
 
-  if [[ "${WORDPRESS_CHECKSUMS}" != "y" ]]; then
-    echo "  wordpress checksums ${site} ... [SKIPPED]" | tee -a "$site_log"
-    echo "WORDPRESS_CHECKSUMS=SKIPPED" >> "$site_rep"
+  echo -en "$(midgard_current_time) ${site}"
+  echo -en "  Wordpress checksums... "
+  if [[ "$WORDPRESS_CHECKSUMS" != "y" ]]; then
+    echo -e "${c_light_blue}[${c_light_red}DISABLED${c_light_blue}]${c_reset}"
+    echo "$(midgard_current_time)  Wordpress Checksums... [DISABLED]" >> "${SITE_LOG_FILE}"
+    echo "WORDPRESS_CHECKSUMS=SKIPPED" >> "${SITE_REPORT_FILE}"
     return 0
   fi
 
-  local version_php="${LOCAL_WEBROOT%/}/wp-includes/version.php"
-  local wp_version="unknown" wp_locale=""
+  echo -e "${c_light_blue}[${c_green}ENABLED${c_light_blue}]${c_reset}"
+  echo "$(midgard_current_time)  Wordpress Checksums... [ENABLED]" >> "${SITE_LOG_FILE}"
+
+  local SITE_SYNC_PATH SITE_DOCUMENT_ROOT_PATH SITE_WEB_ROOT_PATH
+  SITE_SYNC_PATH="$(midgard_get_value_from_array "$assoc_name" LOCAL_SYNC_PATH)"
+  SITE_DOCUMENT_ROOT_PATH="$(midgard_get_value_from_array "$assoc_name" LOCAL_DOCUMENT_ROOT)"
+  SITE_WEB_ROOT_PATH="${SITE_SYNC_PATH}${SITE_DOCUMENT_ROOT_PATH}"
+
+  local checksum_fail=0
+
+  local version_php="${SITE_WEB_ROOT_PATH}/wp-includes/version.php"
+  local wp_version wp_locale
   if [[ -r "$version_php" ]]; then
-    wp_version="$(_php_extract_assigned_scalar "$version_php" "wp_version")" || wp_version="unknown"
+    wp_version="$(_php_extract_assigned_scalar "$version_php" "wp_version")" || wp_version=""
     wp_locale="$(_php_extract_assigned_scalar "$version_php" "wp_local_package")" || wp_locale=""
   fi
 
-  local line
-  line="$(_wp_core_compare_from_cache "$LOCAL_WEBROOT" "$wp_version" "$wp_locale")"
-  echo "$line" | tee -a "$site_log"
+  if [[ -z "$wp_version" ]]; then
+    echo -e "$(midgard_current_time) ${site}    ${c_light_red}Could not determine the WordPress version${c_reset}"
+    echo "$(midgard_current_time)     Could not determine the WordPress version" >> "${SITE_LOG_FILE}"
+    checksum_fail=1
+  else
+    echo -e "$(midgard_current_time) ${site}    Checksum integrity check for WordPress core version ${c_yellow}${wp_version}${c_reset}${wp_locale:+ locale ${c_yellow}${wp_locale}${c_reset}}"
+    echo "$(midgard_current_time)     Checksum integrity check for WordPress core version ${wp_version}${wp_locale:+ locale ${wp_locale}}" >> "${SITE_LOG_FILE}"
+
+    local json_checksum_file="${MIDGARD_WORDPRESS_CHECKSUMS_PATH}/${wp_version}.json"
+    if [[ -n "$wp_locale" && -f "${MIDGARD_WORDPRESS_CHECKSUMS_PATH}/${wp_version}-${wp_locale}.json" ]]; then
+      json_checksum_file="${MIDGARD_WORDPRESS_CHECKSUMS_PATH}/${wp_version}-${wp_locale}.json"
+    fi
+
+    if [[ ! -f "$json_checksum_file" ]]; then
+      echo -e "$(midgard_current_time) ${site}      JSON checksum file ${c_light_red}NOT${c_reset} found: ${c_light_blue}${wp_version}${wp_locale:+-${wp_locale}}.json${c_reset}"
+      echo "$(midgard_current_time)       JSON checksum file NOT found: ${wp_version}${wp_locale:+-${wp_locale}}.json" >> "${SITE_LOG_FILE}"
+      checksum_fail=1
+    else
+      local json_file_list=$(mktemp)
+      local local_file_list=$(mktemp)
+      if ! jq -r '.files | keys[] | select( . | test("^(wp-content/plugins/|wp-content/themes/)") | not )' "$json_checksum_file" 2>/dev/null | LC_ALL=C sort -u >"$json_file_list"; then
+        echo -e "$(midgard_current_time) ${site}      ${c_light_red}FAILED${c_reset} to parse JSON"
+        echo "$(midgard_current_time) ${site}      FAILED to parse JSON" >> "${SITE_LOG_FILE}"
+        rm -f "$json_file_list"
+        checksum_fail=1
+      else
+        if ! ( cd "$SITE_WEB_ROOT_PATH" && find . -type f -printf '%P\n' | LC_ALL=C sort -u >"$local_file_list" ); then
+          echo -e "$(midgard_current_time) ${site}      ${c_light_red}FAILED${c_reset} to enumerate local files"
+          echo "$(midgard_current_time) ${site}      FAILED to enumerate local files"  >> "${SITE_LOG_FILE}"
+          rm -f "$json_file_list" "$local_file_list"
+          checksum_fail=1
+        else
+
+          sort -u "$json_file_list" -o "$json_file_list"
+          sort -u "$local_file_list" -o "$local_file_list"
+
+          while read -r missing; do
+            if [ -n "$missing" ]; then
+              echo -e "$(midgard_current_time) ${site}      ${c_light_red}MISSING${c_reset} file ${c_light_blue}${missing}${c_reset}"
+              echo "$(midgard_current_time) ${site}      MISSING file ${missing}" >> "${SITE_LOG_FILE}"
+              checksum_fail=1
+            fi
+          done < <(comm -23 "$json_file_list" "$local_file_list")
+
+          while read -r extra; do
+            if [ -n "$extra" ] && ! _wp_ignore_extra "$extra"; then
+              echo -e "$(midgard_current_time) ${site}      ${c_light_red}FOUND${c_reset} unexpected file ${c_light_blue}${extra}${c_reset}"
+              echo "$(midgard_current_time) ${site}      FOUND unexpected file ${extra}" >> "${SITE_LOG_FILE}"
+              checksum_fail=1
+            fi
+          done < <(comm -13 "$json_file_list" "$local_file_list")
+
+          while IFS=$'\t' read -r file md5 sha256; do
+            local local_file="${SITE_WEB_ROOT_PATH}/${file}"
+            if [[ -f "$local_file" ]]; then
+              local local_sha256=$(sha256sum "$local_file" | awk '{print $1}')
+              if [[ -n "$local_sha256" && -n "$sha256" ]]; then
+                if [[ "$local_sha256" != "$sha256" ]]; then
+                  echo -e "$(midgard_current_time) ${site}      ${c_light_red}CHECKSUM MISMATCH${c_reset} for ${c_light_blue}${file}${c_reset}"
+                  echo "$(midgard_current_time) ${site}      CHECKSUM MISMATCH for ${file}" >> "${SITE_LOG_FILE}"
+                  checksum_fail=1
+                fi
+              else
+                checksum_fail=1
+              fi
+            else
+              checksum_fail=1
+            fi
+          done < <(jq -r '.files | to_entries[] | select(.key | test("^(wp-content/plugins/|wp-content/themes/)") | not ) | [.key, .value.md5, .value.sha256] | join("\t")' "$json_checksum_file")
+
+          rm -f "$json_file_list" "$local_file_list"
+        fi
+      fi
+    fi
+  fi
+
+  echo -en "$(midgard_current_time) ${site}"
+  echo -en "  Wordpress checksums... "
+  echo -n "$(midgard_current_time)   Wordpress checksums... " >> "${SITE_LOG_FILE}"
+
+  if [[ ${checksum_fail:-0} -eq 0 ]]; then
+    echo -e "${c_light_blue}[${c_green}SUCCESS${c_light_blue}]${c_reset}"
+    echo "[SUCCESS]" >> "${SITE_LOG_FILE}"
+    echo "WORDPRESS_CHECKSUMS=OK" >> "${SITE_REPORT_FILE}"
+    return 0
+  fi
+
+  echo -e "${c_light_blue}[${c_light_red}FAILED${c_light_blue}]${c_reset}"
+  echo "[FAILED]" >> "${SITE_LOG_FILE}"
+  echo "WORDPRESS_CHECKSUMS=FAIL" >> "${SITE_REPORT_FILE}"
+  return 1
 }
-# (EOF)

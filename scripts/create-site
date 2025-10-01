@@ -127,10 +127,13 @@ create_site_main() {
     old[WORDFENCE_ENABLE]="${WORDFENCE_ENABLE-}"
     old[WORDFENCE_VULN_ENABLE]="${WORDFENCE_VULN_ENABLE-}"
     old[WORDFENCE_ENABLE_DB]="${WORDFENCE_ENABLE_DB-}"
+    old[WORDFENCE_DB_REMOVE_POST]="${WORDFENCE_DB_REMOVE_POST-}"
     old[SITE_SCAN_UPLOADS_PHP]="${SITE_SCAN_UPLOADS_PHP-}"
     old[PLUGIN_CHECKSUMS]="${PLUGIN_CHECKSUMS-}"
     old[THEME_CHECKSUMS]="${THEME_CHECKSUMS-}"
     old[WORDPRESS_CHECKSUMS]="${WORDPRESS_CHECKSUMS-}"
+    old[WORDPRESS_CHECKSUMS_UNEXPECTED_FILES]="${WORDPRESS_CHECKSUMS_UNEXPECTED_FILES-}"
+    old[WORDPRESS_CHECKSUMS_IGNORE_PATH]="${WORDPRESS_CHECKSUMS_IGNORE_PATH-}"
     old[REPORTING_ENABLE]="${REPORTING_ENABLE-}"
     old[REPORTING_EMAILS]="${REPORTING_EMAILS-}"
   fi
@@ -278,6 +281,7 @@ create_site_main() {
 # Per-site configuration (encrypted secrets)
 # ===========================================
 HDR
+    echo "# Version : $(date)"
     echo "SITE=$(_escape_val "${SITE_v:-}")"
     echo
     echo "# SSH connection"
@@ -324,11 +328,15 @@ HDR
     echo "WORDFENCE_ENABLE=$(_escape_val "${WORDFENCE_ENABLE_v:-}")"
     echo "WORDFENCE_VULN_ENABLE=$(_escape_val "${WORDFENCE_VULN_ENABLE_v:-}")"
     echo "WORDFENCE_ENABLE_DB=$(_escape_val "${WORDFENCE_ENABLE_DB_v:-}")"
-    echo "WORDFENCE_DB_REMOVE_POST=\"\""
+    echo "WORDFENCE_DB_REMOVE_POST=$(_escape_val "${WORDFENCE_DB_REMOVE_POST:-}")"
     echo "SITE_SCAN_UPLOADS_PHP=$(_escape_val "${SITE_SCAN_UPLOADS_PHP_v:-}")"
     echo "PLUGIN_CHECKSUMS=$(_escape_val "${PLUGIN_CHECKSUMS_v:-}")"
     echo "THEME_CHECKSUMS=$(_escape_val "${THEME_CHECKSUMS_v:-}")"
     echo "WORDPRESS_CHECKSUMS=$(_escape_val "${WORDPRESS_CHECKSUMS_v:-}")"
+    echo
+    echo "WORDPRESS_CHECKSUMS_UNEXPECTED_FILES=$(_escape_val "${WORDPRESS_CHECKSUMS_UNEXPECTED_FILES:-}")"
+    echo
+    echo "WORDPRESS_CHECKSUMS_IGNORE_PATH=$(_escape_val "${WORDPRESS_CHECKSUMS_IGNORE_PATH:-}")"
     echo
     echo "# Reporting"
     echo "REPORTING_ENABLE=$(_escape_val "${REPORTING_ENABLE_v:-}")"

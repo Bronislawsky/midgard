@@ -99,6 +99,8 @@ site_load_into() { # $1=site  $2=array_name
   eval "${arr_name}[PLUGIN_CHECKSUMS]=\"${PLUGIN_CHECKSUMS:-}\""
   eval "${arr_name}[THEME_CHECKSUMS]=\"${THEME_CHECKSUMS:-}\""
   eval "${arr_name}[WORDPRESS_CHECKSUMS]=\"${WORDPRESS_CHECKSUMS:-}\""
+  eval "${arr_name}[WORDPRESS_CHECKSUMS_IGNORE_PATH]=\"${WORDPRESS_CHECKSUMS_IGNORE_PATH:-}\""
+  eval "${arr_name}[WORDPRESS_CHECKSUMS_UNEXPECTED_FILES]=\"${WORDPRESS_CHECKSUMS_UNEXPECTED_FILES:-}\""
   eval "${arr_name}[REPORTING_ENABLE]=\"${REPORTING_ENABLE:-}\""
   eval "${arr_name}[REPORTING_EMAILS]=\"${REPORTING_EMAILS:-}\""
 

@@ -286,7 +286,7 @@ wordpress_checksums_main() {
     else
       local json_file_list=$(mktemp)
       local local_file_list=$(mktemp)
-      if ! jq -r '.files | keys[] | select( . | test("^(wp-content/plugins/|wp-content/themes/)") | not )' "$json_checksum_file" 2>/dev/null | LC_ALL=C sort -u >"$json_file_list"; then
+      if ! jq -r '.files | keys[] | select( . | test("^(wp-content/plugins/|wp-content/themes/|wp-content/languages/)") | not )' "$json_checksum_file" 2>/dev/null | LC_ALL=C sort -u >"$json_file_list"; then
         echo -e "$(midgard_current_time) ${site}      ${c_light_red}FAILED${c_reset} to parse JSON"
         echo "$(midgard_current_time) ${site}      FAILED to parse JSON" >> "${SITE_LOG_FILE}"
         rm -f "$json_file_list"
@@ -334,7 +334,7 @@ wordpress_checksums_main() {
             else
               checksum_fail=1
             fi
-          done < <(jq -r '.files | to_entries[] | select(.key | test("^(wp-content/plugins/|wp-content/themes/)") | not ) | [.key, .value.md5, .value.sha256] | join("\t")' "$json_checksum_file")
+          done < <(jq -r '.files | to_entries[] | select(.key | test("^(wp-content/plugins/|wp-content/themes/|wp-content/languages/)") | not ) | [.key, .value.md5, .value.sha256] | join("\t")' "$json_checksum_file")
 
           rm -f "$json_file_list" "$local_file_list"
         fi

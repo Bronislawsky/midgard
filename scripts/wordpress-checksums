@@ -75,7 +75,7 @@ _is_suspicious() {
     echo -e "$(midgard_current_time) ${site}      Suspicious patterns found in ${c_light_blue}${file}${c_reset}:"
     echo "$found_patterns" | while IFS= read -r line; do
       echo -e "$(midgard_current_time) ${site}        ${c_light_red}${line}${c_reset}"
-      echo "$(midgard_current_time) ${site}        ${line}" >> "${SITE_LOG_FILE}"
+      echo "$(midgard_current_time)         ${line}" >> "${SITE_LOG_FILE}"
     done
     return 0  # Suspicious
   fi
@@ -133,7 +133,7 @@ _wp_ignore_extra() {
         return 1
       else
         echo -e "$(midgard_current_time) ${site}      ${c_yellow}SCANNED${c_reset} ${c_light_blue}${rel}${c_reset} ${c_green}appears OK${c_reset}"
-        echo "$(midgard_current_time) ${site}      Scanned ${rel} and appears OK" >> "${SITE_LOG_FILE}"
+        echo "$(midgard_current_time)       Scanned ${rel} and appears OK" >> "${SITE_LOG_FILE}"
         return 0
       fi
       ;;
@@ -157,7 +157,7 @@ _wp_ignore_extra() {
               return 1
             else
               echo -e "$(midgard_current_time) ${site}      ${c_yellow}SCANNED${c_reset} ${c_light_blue}${rel}${c_reset} ${c_green}appears OK${c_reset}"
-              echo "$(midgard_current_time) ${site}      Scanned ${rel} and appears OK" >> "${SITE_LOG_FILE}"
+              echo "$(midgard_current_time)       Scanned ${rel} and appears OK" >> "${SITE_LOG_FILE}"
               return 0
             fi
           else
@@ -198,12 +198,12 @@ _wp_ignore_extra() {
           have="$(_sha256_file "$file_abs")"
           if [[ -n "$have" && -n "$v" && "$have" == "$v" ]]; then
             echo -e "$(midgard_current_time) ${site}      ${c_cyan}VERIFIED${c_reset} ${c_light_blue}${rel}${c_reset} sha256=${c_green}${have:0:12}…${c_reset}"
-            echo "$(midgard_current_time) ${site}      Verified ${rel} sha256=$have" >> "${SITE_LOG_FILE}"
+            echo "$(midgard_current_time)       Verified ${rel} sha256=$have" >> "${SITE_LOG_FILE}"
             return 0   # accept + ignore
           else
             # mismatch or could not compute — do NOT ignore
             echo -e "$(midgard_current_time) ${site}      ${c_red}DIGEST MISMATCH${c_reset} ${c_light_blue}${rel}${c_reset} expected=${v:0:12}… got=${have:0:12}…"
-            echo "$(midgard_current_time) ${site}      Digest mismatch for ${rel} expected=${v} got=${have}" >> "${SITE_LOG_FILE}"
+            echo "$(midgard_current_time)       Digest mismatch for ${rel} expected=${v} got=${have}" >> "${SITE_LOG_FILE}"
             return 1
           fi
         else

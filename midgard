@@ -211,11 +211,7 @@ status_start "Websites Inspections"
 
 for enabled_site in "${ENABLED_SITES[@]}"; do
 
-  # Uploads PHP Scan
-  if ! scan_uploads_php_site "$enabled_site"; then
-    echo "    - scan for uploads php failed for ${enabled_site}";
-  fi
-
+  scan_uploads_php_main "$enabled_site" || true
   theme_checksums_main "$enabled_site" || true
   plugin_checksums_main "$enabled_site" || true
   wordpress_checksums_main "$enabled_site" || true

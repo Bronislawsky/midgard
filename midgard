@@ -189,15 +189,11 @@ for enabled_site in "${ENABLED_SITES[@]}"; do
 done;
 
 # Start Main Backup Loop (Fetch)
-status_start "Pulling files and database content..."
 echo
 for enabled_site in "${ENABLED_SITES[@]}"; do
   pull_rsync_main "$enabled_site" || true
   pull_sql_main "$enabled_site" || true
 done
-
-# Start Inpection loop
-status_start "Websites Inspections"
 
 for enabled_site in "${ENABLED_SITES[@]}"; do
 
@@ -230,11 +226,7 @@ for enabled_site in "${ENABLED_SITES[@]}"; do
     #exit 1
   fi
 
-  # Wordfence DB scan
-  if ! scan_wordfence_db_site "$enabled_site"; then
-    echo "    - wordfence db scan failed for ${enabled_site}";
-    #exit 1
-  fi
+  scan_wordfence_db_main "$enabled_site" || true
 
   # Restic Sync
   if ! restic_sync_site "$enabled_site"; then

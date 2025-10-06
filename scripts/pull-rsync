@@ -154,7 +154,7 @@ pull_rsync_main() {
     echo "$(midgard_current_time) Remote File Synchronisation [SUCCESS]" >> "$SITE_LOG_FILE"
     echo "RSYNC=OK" >> "$SITE_REPORT_FILE"
   else
-    echo -e "$(midgard_current_time) ${site} Remote File Synchronisation ${c_light_blue}[${c_light_red}FAILED${c_light_bleu}]${c_reset}"
+    echo -e "$(midgard_current_time) ${site} Remote File Synchronisation ${c_light_blue}[${c_light_red}FAILED${c_light_blue}]${c_reset}"
     echo "$(midgard_current_time) Remote File Synchronisation [FAILED]" >> "$SITE_LOG_FILE"
     echo "RSYNC=FAIL" >> "$SITE_REPORT_FILE"
   fi

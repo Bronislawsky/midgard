@@ -100,6 +100,7 @@ scan_wordfence_vuln_site() {
   if ! "$WORDFENCE_BIN" vuln-scan \
         --no-banner --no-color --no-verbose --accept-terms \
         --allow-io-errors \
+        --no-cache \
         --output-format line-delimited \
         --output-columns id \
         "$wp_root" >"$tmp_ids" 2>/dev/null; then

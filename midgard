@@ -193,6 +193,7 @@ echo
 for enabled_site in "${ENABLED_SITES[@]}"; do
   pull_rsync_main "$enabled_site" || true
   pull_sql_main "$enabled_site" || true
+  restic_sync_site "$enabled_site" || true
 done
 
 for enabled_site in "${ENABLED_SITES[@]}"; do
@@ -214,20 +215,9 @@ for enabled_site in "${ENABLED_SITES[@]}"; do
     #exit 1
   fi
 
-  # Wordfence malware
-  if ! scan_wordfence_malware_site "$enabled_site"; then
-    echo "    - wordfence malware scan failed for ${enabled_site}";
-    #exit 1
-  fi
-
+  scan_wordfence_malware_main "$enabled_site" || true
   scan_wordfence_vuln_main "$enabled_site" || true
   scan_wordfence_db_main "$enabled_site" || true
-
-  # Restic Sync
-  if ! restic_sync_site "$enabled_site"; then
-    echo "    - restic sync failed for ${enabled_site}";
-    #exit 1
-  fi
 
   # Generate report Site
   if ! report_generate_site "$enabled_site"; then

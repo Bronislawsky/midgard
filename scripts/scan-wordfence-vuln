@@ -57,7 +57,7 @@ scan_wordfence_vuln_main() {
   fi
 
   echo -e "$(midgard_current_time) ${site} Wordfence-CLI vulnerability Scan ${c_light_blue}[${c_green}STARTED${c_light_blue}]${c_reset}"
-  echo "$(midgard_current_time) Wordfence-CLI Database Scan [STARTED]" >> "$SITE_LOG_FILE"
+  echo "$(midgard_current_time) Wordfence-CLI Vulnerability Scan [STARTED]" >> "$SITE_LOG_FILE"
 
   LOCAL_SYNC_PATH="$(midgard_get_value_from_array "$assoc_name" LOCAL_SYNC_PATH)"
   LOCAL_DOCUMENT_ROOT="$(midgard_get_value_from_array "$assoc_name" LOCAL_DOCUMENT_ROOT)"
@@ -76,7 +76,7 @@ scan_wordfence_vuln_main() {
     done
     echo -e "$(midgard_current_time) ${site} Wordfence-CLI vulnerability Scan ${c_light_blue}[${c_light_red}FAILED${c_light_blue}]${c_reset}"
     echo "$(midgard_current_time) Wordfence-CLI vulnerability Scan [FAILED]" >> "$SITE_LOG_FILE"
-    echo "WORDFENCE_DB=FAIL" >> "${SITE_REPORT_FILE}"
+    echo "WORDFENCE_VULN=FAIL" >> "${SITE_REPORT_FILE}"
     return 1
   fi
 
@@ -139,144 +139,4 @@ scan_wordfence_vuln_main() {
     return 0
   fi
 
-}
-
-
-
-
-
-
-
-
-
-
-
-
-
-return
-
-# Safety guard
-if [[ "${MIDGARD_MAIN:-}" != "1" ]]; then
-  echo "This script must be sourced from the midgard launcher." >&2
-  return 1 2>/dev/null || exit 1
-fi
-
-# name-ref getter: _get <assoc_array_name> <key>
-_get() {
-  local __arr="$1" __key="$2"
-  declare -n __ref="$__arr"
-  printf '%s' "${__ref[$__key]-}"
-}
-
-scan_wordfence_vuln_site() {
-  local site="${1:-}"
-  [[ -n "$site" ]] || { echo "scan_wordfence_vuln_site: missing site"; return 1; }
-
-  local arr="${CONFIG_SITES[$site]:-}"
-  [[ -n "$arr" ]] || { echo "scan_wordfence_vuln_site: site not loaded: $site"; return 1; }
-
-  # Pull vars from loaded site map
-  local LOCAL_SYNC_PATH LOCAL_DOCUMENT_ROOT WORDFENCE_BIN WORDFENCE_VULN_ENABLE
-  LOCAL_SYNC_PATH="$(_get "$arr" LOCAL_SYNC_PATH)"
-  LOCAL_DOCUMENT_ROOT="$(_get "$arr" LOCAL_DOCUMENT_ROOT)"
-  WORDFENCE_BIN="${WORDFENCE_BIN:-$HOME/.local/bin/wordfence}"   # fallback if not set in global config
-  WORDFENCE_VULN_ENABLE="$(_get "$arr" WORDFENCE_VULN_ENABLE)"
-
-  # Paths for logs/reports
-  local log_dir="logs/${EPOCH_TIMESTAMP}"
-  local rep_dir="reports/${EPOCH_TIMESTAMP}"
-  local site_log="${log_dir}/${site}.log"
-  local site_rep="${rep_dir}/${site}.report"
-  mkdir -p "$log_dir" "$rep_dir"
-
-  # Respect per-site toggle
-  if [[ "${WORDFENCE_VULN_ENABLE}" != "y" ]]; then
-    echo "  wordfence vuln-scan ${site} ... [SKIPPED]" | tee -a "$site_log"
-    echo "WORDFENCE_VULN=SKIPPED" >> "$site_rep"
-    return 0
-  fi
-
-  # Validate binary
-  if [[ ! -x "$WORDFENCE_BIN" ]]; then
-    status_start "  wordfence vuln-scan ${site} ..."
-    status_fail
-    echo "    - Wordfence CLI not executable: ${WORDFENCE_BIN}" | tee -a "$site_log"
-    echo "WORDFENCE_VULN=FAIL" >> "$site_rep"
-    return 1
-  fi
-
-  # Determine WordPress root
-  local wp_root="${LOCAL_SYNC_PATH%/}${LOCAL_DOCUMENT_ROOT}"
-  if [[ ! -d "$wp_root" ]]; then
-    status_start "  wordfence vuln-scan ${site} (missing ${wp_root}) ..."
-    status_fail
-    echo "    - WordPress root not found: ${wp_root}" | tee -a "$site_log"
-    echo "WORDFENCE_VULN=FAIL" >> "$site_rep"
-    return 1
-  fi
-
-  status_start "  wordfence vuln-scan ${site} ..."
-
-  # Use line-delimited IDs for a clean count; still capture human output to log.
-  # We run the scanner once with human output (for the log), then a second time
-  # with line-delimited IDs to count findings. This avoids brittle greps.
-  local tmp_human tmp_ids rc1=0 rc2=0
-  tmp_human="$(mktemp -t wf-vuln-human.${site}.XXXXXX)"
-  tmp_ids="$(mktemp -t wf-vuln-ids.${site}.XXXXXX)"
-
-  # 1) Human-readable run (for operator log)
-  if ! "$WORDFENCE_BIN" vuln-scan \
-        --no-banner --no-color --no-verbose --accept-terms \
-        --allow-io-errors \
-        "$wp_root" >"$tmp_human" 2>&1; then
-    rc1=$?
-  fi
-  cat "$tmp_human" >>"$site_log"
-
-  # 2) Machine-friendly run to count exactly how many vulns were found
-  #    If this fails, we still fall back to human run result.
-  if ! "$WORDFENCE_BIN" vuln-scan \
-        --no-banner --no-color --no-verbose --accept-terms \
-        --allow-io-errors \
-        --no-cache \
-        --output-format line-delimited \
-        --output-columns id \
-        "$wp_root" >"$tmp_ids" 2>/dev/null; then
-    rc2=$?
-  fi
-
-  # Count vulnerability records (each line is an ID)
-  local vuln_count
-  if [[ "$rc2" -eq 0 ]]; then
-    # Trim blank lines just in case
-    vuln_count="$(grep -cve '^[[:space:]]*$' "$tmp_ids" || true)"
-  else
-    # If the machine-friendly run failed, try a light heuristic on the human log
-    # (look for lines that look like a result block)
-    vuln_count="$(grep -Eic 'CVE-|Vulnerability|WordPress core vulnerability|plugin.*vulnerab|theme.*vulnerab' "$tmp_human" || true)"
-  fi
-
-  rm -f "$tmp_human" "$tmp_ids"
-
-  # Decide final status
-  # - If either run exited with a hard error (non-zero) AND we didn’t get a count, mark FAIL
-  # - If vuln_count > 0 => FAIL (we want human intervention)
-  # - Else OK
-  if { [[ "$rc1" -ne 0 ]] && [[ "$rc2" -ne 0 ]]; } && [[ -z "${vuln_count:-}" ]]; then
-    status_fail
-    echo "    - wordfence vuln-scan errored (rc1=$rc1 rc2=$rc2) and no results to parse" | tee -a "$site_log"
-    echo "WORDFENCE_VULN=FAIL" >> "$site_rep"
-    return 1
-  fi
-
-  if [[ "${vuln_count:-0}" -gt 0 ]]; then
-    status_fail
-    echo "    - vulnerabilities detected: ${vuln_count} (see log for details)" | tee -a "$site_log"
-    echo "WORDFENCE_VULN=FAIL" >> "$site_rep"
-    return 1
-  fi
-
-  status_ok
-  echo "WORDFENCE_VULN=OK" >> "$site_rep"
-  return 0
 }

@@ -202,12 +202,7 @@ for enabled_site in "${ENABLED_SITES[@]}"; do
   theme_checksums_main "$enabled_site" || true
   plugin_checksums_main "$enabled_site" || true
   wordpress_checksums_main "$enabled_site" || true
-
-  # ClamAV
-  if ! scan_clamav_site "$enabled_site"; then
-    echo "    - clamdscan failed for ${enabled_site}";
-    #exit 1
-  fi
+  scan_clamav_main "$enabled_site" || true
 
   # Maldet
   if ! scan_maldet_site "$enabled_site"; then

@@ -9,71 +9,112 @@
 # |__|_|  /__\____ |\___  (____  /__|  \____ |
 #       \/        \/_____/     \/           \/
 #
-# scan-clamav — run clamdscan on local mirror for a site
-#   - must be sourced by ./midgard (MIDGARD_MAIN=1)
-#   - uses CONFIG_SITES + EPOCH_TIMESTAMP + status_* helpers
-#   - logs to   ./logs/$EPOCH_TIMESTAMP/<site>.log
-#   - appends   ./reports/$EPOCH_TIMESTAMP/<site>.report   with CLAMAV=OK|FAIL
-#   - exit 0 on “no infection”, non-zero on virus found or error
+# scan-clamav
 #------------------------------------------------------------------------------
-
-# Safety guard
-if [[ "${MIDGARD_MAIN:-}" != "1" ]]; then
+[[ "${MIDGARD_MAIN:-}" == "1" ]] || {
   echo "This script must be sourced from the midgard launcher." >&2
   return 1 2>/dev/null || exit 1
-fi
-
-# Helper: read value from an associative array by name
-# usage: _get <assoc_array_name> <key>
-_get() {
-  local __arr="$1" __key="$2"
-  declare -n __ref="$__arr"        # name reference to the assoc array
-  printf '%s' "${__ref[$__key]-}"  # - avoids set -u blowups if missing
 }
 
-scan_clamav_site() {
-  local site="${1:-}"
-  [[ -n "$site" ]] || { echo "scan_clamav_site: missing site"; return 1; }
+scan_clamav_main() {
 
-  local arr="${CONFIG_SITES[$site]:-}"
-  [[ -n "$arr" ]] || { echo "scan_clamav_site: site not loaded: $site"; return 1; }
+  local site="$1"
 
-  # Vars
-  local LOCAL_SYNC_PATH CLAMAV_ENABLE
-  LOCAL_SYNC_PATH="$(_get "$arr" LOCAL_SYNC_PATH)"
-  CLAMAV_ENABLE="$(_get "$arr" CLAMAV_ENABLE)"
+  mkdir -p "${MIDGARD_SESSION_LOG_DIR}" "${MIDGARD_SESSION_REPORT_DIR}"
+  local SITE_LOG_FILE="${MIDGARD_SESSION_LOG_DIR}/${site}.log"
+  local SITE_REPORT_FILE="${MIDGARD_SESSION_REPORT_DIR}/${site}.report"
 
-  local log_dir="logs/${EPOCH_TIMESTAMP}"
-  local rep_dir="reports/${EPOCH_TIMESTAMP}"
-  local site_log="${log_dir}/${site}.log"
-  local site_rep="${rep_dir}/${site}.report"
-  mkdir -p "$log_dir" "$rep_dir"
+  if [[ -z "$site" ]]; then
+    echo "scan_clamav_main: missing site" >&2
+    echo "$(midgard_current_time) ClamAV Scan [FAILED]" >> "$SITE_LOG_FILE"
+    echo "CLAMAV=FAIL" >> "$SITE_REPORT_FILE"
+    return 1
+  fi
+
+  local assoc_name="${CONFIG_SITES[$site]:-}"
+  if [[ -z "$assoc_name" ]]; then
+    echo "scan_clamav_main: site not loaded: $site" >&2
+    echo "$(midgard_current_time) ClamAV Scan" >> "$SITE_LOG_FILE"
+    echo "CLAMAV=FAIL" >> "$SITE_REPORT_FILE"
+    return 1
+  fi
+
+  # Per-site toggles & values (from sites-data / .conf already loaded)
+  local CLAMAV_ENABLE
+  local LOCAL_SYNC_PATH
+
+  CLAMAV_ENABLE="$(midgard_get_value_from_array "$assoc_name" CLAMAV_ENABLE)"
 
   if [[ "$CLAMAV_ENABLE" != "y" ]]; then
-    echo "  clamdscan ${site} ... [SKIPPED]" | tee -a "$site_log"
-    echo "CLAMAV=SKIPPED" >> "$site_rep"
+    echo -e "$(midgard_current_time) ${site} ClamAV Scan ${c_light_blue}[${c_light_red}DISABLED${c_light_blue}]${c_reset}"
+    echo "$(midgard_current_time) ClamAV Scan [DISABLED]" >> "${SITE_LOG_FILE}"
+    echo "CLAMAV=SKIPPED" >> "${SITE_REPORT_FILE}"
     return 0
   fi
 
-  local scan_root="$LOCAL_SYNC_PATH"
-  if [[ ! -d "$scan_root" ]]; then
-    status_start "  clamdscan ${site} (missing ${scan_root}) ..."
-    status_fail
-    echo "    - scan root not found: ${scan_root}" | tee -a "$site_log"
-    echo "CLAMAV=FAIL" >> "$site_rep"
+  echo -e "$(midgard_current_time) ${site} ClamAV Scan ${c_light_blue}[${c_green}STARTED${c_light_blue}]${c_reset}"
+  echo "$(midgard_current_time) ClamAV Scan [STARTED]" >> "$SITE_LOG_FILE"
+
+  LOCAL_SYNC_PATH="$(midgard_get_value_from_array "$assoc_name" LOCAL_SYNC_PATH)"
+
+  local errors=()
+  [[ -n "$LOCAL_SYNC_PATH" ]] || errors+=("LOCAL_SYNC_PATH")
+  [[ -d "$LOCAL_SYNC_PATH" ]] || errors+=("LOCAL_SYNC_PATH")
+  [[ -x "$CLAMDSCAN_BIN"   ]] || errors+=("CLAMDSCAN_BIN")
+
+  if (( ${#errors[@]} )); then
+    for err in "${errors[@]}"; do
+      echo -e "$(midgard_current_time) ${site}   Please verify ${c_light_red}${err}${c_reset}"
+    done
+    echo -e "$(midgard_current_time) ${site} ClamAV Scan ${c_light_blue}[${c_light_red}FAILED${c_light_blue}]${c_reset}"
+    echo "$(midgard_current_time) ClamAV Scan [FAILED]" >> "$SITE_LOG_FILE"
+    echo "CLAMAV=FAIL" >> "${SITE_REPORT_FILE}"
     return 1
   fi
 
-  status_start "  clamdscan ${site} ..."
-  if sudo -n "$CLAMDSCAN_BIN" --multiscan --fdpass "$scan_root" \
-       >>"$site_log" 2>&1; then
-    status_ok
-    echo "CLAMAV=OK" >> "$site_rep"
-    return 0
-  else
-    status_fail
-    echo "    - clamdscan found issues in ${site}" | tee -a "$site_log"
-    echo "CLAMAV=FAIL" >> "$site_rep"
+  # Run clamdscan and capture all output to a temp file
+  local tmp_out rc
+  tmp_out="$(mktemp -t "clamav.${site}.XXXXXXXX.out")"
+
+  sudo -n "$CLAMDSCAN_BIN" --allmatch --no-summary --multiscan --fdpass "$LOCAL_SYNC_PATH" >"$tmp_out" 2>&1
+  rc=$?
+
+  if (( rc != 0 )); then
+    while IFS= read -r line; do
+      echo -e "$(midgard_current_time) ${site}   Found : ${c_light_red}${line}${c_reset}"
+      echo "$(midgard_current_time)    Found : ${line}" >> "$SITE_LOG_FILE"
+    done < "$tmp_out"
+    rm -f $tmp_out
+    echo -e "$(midgard_current_time) ${site} ClamAV Scan ${c_light_blue}[${c_light_red}FAILED${c_light_blue}]${c_reset}"
+    echo "$(midgard_current_time) ClamAV Scan [FAILED]" >> "$SITE_LOG_FILE"
+    echo "CLAMAV=FAIL" >> "${SITE_REPORT_FILE}"
     return 1
   fi
+
+  echo -e "$(midgard_current_time) ${site} ClamAV Scan ${c_light_blue}[${c_green}SUCCESS${c_light_blue}]${c_reset}"
+  echo "$(midgard_current_time) ClamAV Scan [SUCCESS]" >> "$SITE_LOG_FILE"
+  echo "CLAMAV=OK" >> "${SITE_REPORT_FILE}"
+  rm -f $tmp_out
+  return 0
 }
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

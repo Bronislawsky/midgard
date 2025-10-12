@@ -148,8 +148,8 @@ scan_wordfence_db_main() {
     local  one
     for one in $WORDFENCE_DB_REMOVE_POST; do
       [[ "$one" =~ ^[0-9]+$ ]] || continue
-      echo -e "$(midgard_current_time) ${site}   Prunning post : ${c_yellow}$one${c_reset}"
-      echo "$(midgard_current_time)    Prunning post : $one" >> "$SITE_LOG_FILE"
+      echo -e "$(midgard_current_time) ${site}   Pruning post : ${c_yellow}$one${c_reset}"
+      echo "$(midgard_current_time)    Pruning post : $one" >> "$SITE_LOG_FILE"
 
 {
       cat <<SQL

@@ -203,13 +203,7 @@ for enabled_site in "${ENABLED_SITES[@]}"; do
   plugin_checksums_main "$enabled_site" || true
   wordpress_checksums_main "$enabled_site" || true
   scan_clamav_main "$enabled_site" || true
-
-  # Maldet
-  if ! scan_maldet_site "$enabled_site"; then
-    echo "    - maldet scan failed for ${enabled_site}";
-    #exit 1
-  fi
-
+  scan_maldet_main "$enabled_site" || true
   scan_wordfence_malware_main "$enabled_site" || true
   scan_wordfence_vuln_main "$enabled_site" || true
   scan_wordfence_db_main "$enabled_site" || true
@@ -227,6 +221,9 @@ for enabled_site in "${ENABLED_SITES[@]}"; do
   fi
 
 done
+
+# Just making sure the global report gets AFTER the last site report
+sleep 30
 
 # generate and send global report
 report_generate_global "$EPOCH_TIMESTAMP" || echo "  - global report generation failed"

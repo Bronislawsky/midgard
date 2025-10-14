@@ -46,7 +46,7 @@ scan_uploads_php_main() {
 
   # Console header (same layout as other checks)
   echo
-  echo -en "$(midgard_current_time) ${site}  "
+  echo -en "$(midgard_current_time) ${site} "
   echo -en "Scan uploads for PHP & executables... "
   if [[ "$UPLOADS_PHP_ENABLE" != "y" ]]; then
     echo -e "${c_light_blue}[${c_light_red}DISABLED${c_light_blue}]${c_reset}"
@@ -111,12 +111,51 @@ scan_uploads_php_main() {
     return 0
   fi
 
+  # ---------------------------------------------------------------------------
+  # Allowlist: unexpected PHP files with required SHA256 (relative paths)
+  # Example var content:
+  # UPLOADS_PHP_CHECKSUMS_UNEXPECTED_FILES="
+  # wp-content/uploads/wpforms/cache/index.php:76e7cd...06c6f
+  # "
+  # ---------------------------------------------------------------------------
+  local UPLOADS_PHP_CHECKSUMS_UNEXPECTED_FILES
+  UPLOADS_PHP_CHECKSUMS_UNEXPECTED_FILES="$( midgard_get_value_from_array "$assoc_name" UPLOADS_PHP_CHECKSUMS_UNEXPECTED_FILES )"
+
+  # Build allowlist map: key = relative path from site web root, val = sha256
+  declare -A __ALLOW_PHP_SHA256=()
+  if [[ -n "${UPLOADS_PHP_CHECKSUMS_UNEXPECTED_FILES// }" ]]; then
+    while IFS= read -r __line; do
+      __line="${__line%%#*}"; __line="${__line%"${__line##*[![:space:]]}"}"
+      [[ -z "$__line" ]] && continue
+      # split on first colon
+      local __p="${__line%%:*}"
+      local __h="${__line#*:}"
+      __p="${__p#"${__p%%[![:space:]]*}"}"; __p="${__p%"${__p##*[![:space:]]}"}"
+      __h="${__h#"${__h%%[![:space:]]*}"}"; __h="${__h%"${__h##*[![:space:]]}"}"
+      [[ -n "$__p" && -n "$__h" ]] && __ALLOW_PHP_SHA256["$__p"]="$__h"
+    done <<< "$UPLOADS_PHP_CHECKSUMS_UNEXPECTED_FILES"
+  fi
+
+  # Helper: compute sha256 (prefer sha256sum, fallback to openssl)
+  _sha256_of() {
+    local f="$1"
+    if command -v sha256sum >/dev/null 2>&1; then
+      sha256sum "$f" 2>/dev/null | awk '{print $1}'
+    elif command -v openssl >/dev/null 2>&1; then
+      openssl dgst -sha256 "$f" 2>/dev/null | awk '{print $NF}'
+    else
+      echo ""
+      return 1
+    fi
+  }
+
   # Temporary files for findings
   local tmp_php
   tmp_php="$(mktemp -t uploads.php.${site}.XXXXXX)"
 
   local rc=0
   local rc_php=0
+  local violations=0
 
   # 1) PHP-like extensions (follow symlinks)
   if ! find -L "${SITE_UPLOADS_PATH}" -type f \( \
@@ -125,17 +164,49 @@ scan_uploads_php_main() {
       \) -print > "${tmp_php}" 2>&1; then
     rc_php=$?
   fi
-  echo -e "$(midgard_current_time) ${site}  PHP-like extentions..."
-  echo "$(midgard_current_time)   PHP-like extentions..." >> "${SITE_LOG_FILE}"
+  echo -e "$(midgard_current_time) ${site}  PHP-like extensions..."
+  echo "$(midgard_current_time)   PHP-like extensions..." >> "${SITE_LOG_FILE}"
+
   while IFS= read -r line; do
-    echo -e "$(midgard_current_time) ${site}    ${c_light_red}FOUND${c_reset} : ${c_light_blue}$line${c_reset}"
-    echo "$(midgard_current_time)     FOUND : $line" >> "${SITE_LOG_FILE}"
-     rc=1 # Fail automatically
+    [[ -z "$line" ]] && continue
+
+    # Compute relative path from site web root for allowlist matching
+    local rel
+    if rel="$(realpath --relative-to "$SITE_WEB_ROOT_PATH" "$line" 2>/dev/null)"; then
+      :
+    else
+      rel="${line#${SITE_WEB_ROOT_PATH%/}/}"
+    fi
+
+    if [[ -n "${__ALLOW_PHP_SHA256[$rel]:-}" ]]; then
+      # Allowlisted: verify checksum
+      local want_sha="${__ALLOW_PHP_SHA256[$rel]}"
+      local got_sha="$(_sha256_of "$line")"
+      if [[ -n "$got_sha" && "$got_sha" == "$want_sha" ]]; then
+        # VERIFIED => no violation
+        echo -e "$(midgard_current_time) ${site}    ${c_light_blue}VERIFIED${c_reset} : ${c_light_blue}${rel}${c_reset}"
+        echo    "$(midgard_current_time)     VERIFIED : ${rel}" >> "${SITE_LOG_FILE}"
+      else
+        # Allowlisted but checksum mismatch => VIOLATION
+        echo -e "$(midgard_current_time) ${site}    ${c_light_red}FOUND (checksum mismatch)${c_reset} : ${c_light_blue}${line}${c_reset}"
+        echo    "$(midgard_current_time)     FOUND (checksum mismatch) : ${line}" >> "${SITE_LOG_FILE}"
+        violations=$((violations+1))
+      fi
+    else
+      # Not allowlisted => VIOLATION
+      echo -e "$(midgard_current_time) ${site}    ${c_light_red}FOUND${c_reset} : ${c_light_blue}$line${c_reset}"
+      echo    "$(midgard_current_time)     FOUND : $line" >> "${SITE_LOG_FILE}"
+      violations=$((violations+1))
+    fi
   done < "${tmp_php}"
 
-  # Count hits (absolute paths only)
-  local hits_php=0
-  grep -qE '^/' "${tmp_php}"    && hits_php="$(grep -E '^/' "${tmp_php}"    | wc -l | tr -d ' ')"
+  # Any violations?
+  if (( violations > 0 )); then
+    echo -e "$(midgard_current_time) ${site} Scan uploads for PHP & executables... ${c_light_blue}[${c_light_red}FAIL${c_light_blue}]${c_reset}"
+    echo   "$(midgard_current_time) Scan uploads for PHP & executables... [FAIL]" >> "${SITE_LOG_FILE}"
+    echo "UPLOADS_PHP=FAIL" >> "${SITE_REPORT_FILE}"
+    return 1
+  fi
 
   # Determine overall rc (error from find)
   (( rc_php != 0 ))    && rc=1
@@ -150,15 +221,6 @@ scan_uploads_php_main() {
     echo "UPLOADS_PHP=FAIL" >> "${SITE_REPORT_FILE}"
     return 1
   fi
-
-  # Any hits?
-  if (( hits_php > 0)); then
-    echo -e "$(midgard_current_time) ${site} Scan uploads for PHP & executables... ${c_light_blue}[${c_light_red}FAIL${c_light_blue}]${c_reset}"
-    echo "$(midgard_current_time) Scan uploads for PHP & executables... [FAIL]" >> "${SITE_LOG_FILE}"
-    echo "UPLOADS_PHP=FAIL" >> "${SITE_REPORT_FILE}"
-    return 1
-  fi
-
 
   echo -e "$(midgard_current_time) ${site} Scan uploads for PHP & executables... ${c_light_blue}[${c_green}SUCCESS${c_light_blue}]${c_reset}"
   echo "$(midgard_current_time) Scan uploads for PHP & executables... [SUCCESS]" >> "${SITE_LOG_FILE}"

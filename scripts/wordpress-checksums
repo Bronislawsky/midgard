@@ -218,6 +218,36 @@ _wp_ignore_extra() {
   return 1
 }
 
+# Should a missing file be tolerated (warn-only)?
+_wp_allow_missing() {
+  local rel="$1"
+
+  # --- defaults most people remove on purpose ---
+  local -a DEFAULT_ALLOWED_MISSING
+ #=("license.txt" "readme.html" "wp-config-sample.php")
+
+  # --- build ALLOWED_MISSING from WORDPRESS_CHECKSUMS_ALLOWED_MISSING (array or multi-line) ---
+  local -a ALLOWED_MISSING=("${DEFAULT_ALLOWED_MISSING[@]}")
+  if declare -p WORDPRESS_CHECKSUMS_ALLOWED_MISSING &>/dev/null; then
+    if [[ "$(declare -p WORDPRESS_CHECKSUMS_ALLOWED_MISSING 2>/dev/null)" == "declare -a"* ]]; then
+      ALLOWED_MISSING+=("${WORDPRESS_CHECKSUMS_ALLOWED_MISSING[@]}")
+    else
+      while IFS= read -r line; do
+        line="${line#"${line%%[![:space:]]*}"}"
+        line="${line%"${line##*[![:space:]]}"}"
+        [[ -z "$line" || "$line" == \#* ]] && continue
+        ALLOWED_MISSING+=("$line")
+      done <<< "${WORDPRESS_CHECKSUMS_ALLOWED_MISSING}"
+    fi
+  fi
+
+  local x
+  for x in "${ALLOWED_MISSING[@]}"; do
+    [[ "$rel" == "$x" ]] && return 0
+  done
+  return 1
+}
+
 # Usage: wordpress_checksums_main "<site>"
 wordpress_checksums_main() {
   local site="${1:-}"
@@ -239,6 +269,7 @@ wordpress_checksums_main() {
   local WORDPRESS_CHECKSUMS="$(midgard_get_value_from_array "$assoc_name" WORDPRESS_CHECKSUMS)"
   local WORDPRESS_CHECKSUMS_IGNORE_PATH="$(midgard_get_value_from_array "$assoc_name" WORDPRESS_CHECKSUMS_IGNORE_PATH)"
   local WORDPRESS_CHECKSUMS_UNEXPECTED_FILES="$(midgard_get_value_from_array "$assoc_name" WORDPRESS_CHECKSUMS_UNEXPECTED_FILES)"
+  local WORDPRESS_CHECKSUMS_ALLOWED_MISSING="$(midgard_get_value_from_array "$assoc_name" WORDPRESS_CHECKSUMS_ALLOWED_MISSING)"
 
   echo -en "$(midgard_current_time) ${site}"
   echo -en "  Wordpress checksums... "
@@ -303,9 +334,14 @@ wordpress_checksums_main() {
           sort -u "$local_file_list" -o "$local_file_list"
 
           while read -r missing; do
-            if [ -n "$missing" ]; then
+            [[ -z "$missing" ]] && continue
+            if _wp_allow_missing "$missing"; then
+              echo -e "$(midgard_current_time) ${site}      ${c_yellow}EXPECTED MISSING${c_reset} ${c_light_blue}${missing}${c_reset} (intentionally removed)"
+              echo "$(midgard_current_time)        EXPECTED MISSING ${missing} (intentionally removed)" >> "${SITE_LOG_FILE}"
+              # do not set checksum_fail
+            else
               echo -e "$(midgard_current_time) ${site}      ${c_light_red}MISSING${c_reset} file ${c_light_blue}${missing}${c_reset}"
-              echo "$(midgard_current_time) ${site}      MISSING file ${missing}" >> "${SITE_LOG_FILE}"
+              echo "$(midgard_current_time)        MISSING file ${missing}" >> "${SITE_LOG_FILE}"
               checksum_fail=1
             fi
           done < <(comm -23 "$json_file_list" "$local_file_list")
@@ -332,7 +368,12 @@ wordpress_checksums_main() {
                 checksum_fail=1
               fi
             else
-              checksum_fail=1
+              if _wp_allow_missing "$file"; then
+                # expected missing: already warned in the comm -23 loop
+                :
+              else
+                checksum_fail=1
+              fi
             fi
           done < <(jq -r '.files | to_entries[] | select(.key | test("^(wp-content/plugins/|wp-content/themes/|wp-content/languages/)") | not ) | [.key, .value.md5, .value.sha256] | join("\t")' "$json_checksum_file")
 

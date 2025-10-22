@@ -105,6 +105,7 @@ site_load_into() { # $1=site  $2=array_name
   eval "${arr_name}[WORDPRESS_CHECKSUMS_ALLOWED_MISSING]=\"${WORDPRESS_CHECKSUMS_ALLOWED_MISSING:-}\""
   eval "${arr_name}[REPORTING_ENABLE]=\"${REPORTING_ENABLE:-}\""
   eval "${arr_name}[REPORTING_EMAILS]=\"${REPORTING_EMAILS:-}\""
+  eval "${arr_name}[LOCAL_ARCHIVE]=\"${LOCAL_ARCHIVE:-}\""
 
   # Paths
   eval "${arr_name}[DATA_DIR]=\"${data}\""

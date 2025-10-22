@@ -138,6 +138,7 @@ create_site_main() {
     old[WORDPRESS_CHECKSUMS_IGNORE_PATH]="${WORDPRESS_CHECKSUMS_IGNORE_PATH-}"
     old[REPORTING_ENABLE]="${REPORTING_ENABLE-}"
     old[REPORTING_EMAILS]="${REPORTING_EMAILS-}"
+    old[LOCAL_ARCHIVE]="${LOCAL_ARCHIVE-}"
   fi
 
   # Decrypt old sensitive fields (if present & key matches)
@@ -174,6 +175,7 @@ create_site_main() {
   local LOCAL_ARCHIVE_RETENTION_DAYS_v RESTIC_RETENTION_DAYS_v LOG_RETENTION_DAYS_v
   local AWS_ACCESS_KEY_ID_v AWS_SECRET_ACCESS_KEY_v AWS_S3_BUCKET_v AWS_REGION_v AWS_S3_PATH_v AWS_RESTIC_PASSWORD_v
   local CLAMAV_ENABLE_v MALDET_ENABLE_v WORDFENCE_ENABLE_v WORDFENCE_VULN_ENABLE_v WORDFENCE_ENABLE_DB_v
+  local LOCAL_ARCHIVE_v
   local UPLOADS_PHP_ENABLE_v UPLOADS_PHP_CHECKSUMS_UNEXPECTED_FILES_v PLUGIN_CHECKSUMS_v WORDPRESS_CHECKSUMS_v THEME_CHECKSUMS_v
   local REPORTING_ENABLE_v REPORTING_EMAILS_v
 
@@ -249,6 +251,8 @@ create_site_main() {
   PLUGIN_CHECKSUMS_v="$(prompt_value PLUGIN_CHECKSUMS "scan plugin checksums (y/n)" "${old[PLUGIN_CHECKSUMS]-y}")"
   THEME_CHECKSUMS_v="$(prompt_value THEME_CHECKSUMS "scan theme checksums (y/n)" "${old[THEME_CHECKSUMS]-y}")"
   WORDPRESS_CHECKSUMS_v="$(prompt_value WORDPRESS_CHECKSUMS "scan wordpress checksums (y/n)" "${old[WORDPRESS_CHECKSUMS]-y}")"
+
+  LOCAL_ARCHIVE_v="$(prompt_value LOCAL_ARCHIVE "create a local archive (y/n)" "${old[LOCAL_ARCHIVE]-y}")"
 
   REPORTING_ENABLE_v="$(prompt_value REPORTING_ENABLE "Enable per-site reporting (y/n)" "${old[REPORTING_ENABLE]-y}")"
   REPORTING_EMAILS_v="$(prompt_value REPORTING_EMAILS "Comma/space-separated report recipients" "${old[REPORTING_EMAILS]-midgard@example.com}")"
@@ -332,6 +336,7 @@ HDR
     echo "WORDFENCE_ENABLE_DB=$(_escape_val "${WORDFENCE_ENABLE_DB_v:-}")"
     echo "WORDFENCE_DB_REMOVE_POST=$(_escape_val "${WORDFENCE_DB_REMOVE_POST:-}")"
     echo "UPLOADS_PHP_ENABLE=$(_escape_val "${UPLOADS_PHP_ENABLE_v:-}")"
+    echo "LOCAL_ARCHIVE=$(_escape_val "${LOCAL_ARCHIVE_v:-}")"
 
     echo "UPLOADS_PHP_CHECKSUMS_UNEXPECTED_FILES=$(_escape_val "${UPLOADS_PHP_CHECKSUMS_UNEXPECTED_FILES_v:-}")"
 

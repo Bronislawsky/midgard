@@ -104,6 +104,9 @@ source "$(dirname "$0")/scripts/theme-checksums"
 # wordpress checkums
 source "$(dirname "$0")/scripts/wordpress-checksums"
 
+# local archive
+source "$(dirname "$0")/scripts/local-archive"
+
 # Amazon S3 Restic Sync
 source "$(dirname "$0")/scripts/restic-sync"
 
@@ -207,6 +210,7 @@ for enabled_site in "${ENABLED_SITES[@]}"; do
   scan_wordfence_malware_main "$enabled_site" || true
   scan_wordfence_vuln_main "$enabled_site" || true
   scan_wordfence_db_main "$enabled_site" || true
+  local_archive_main "$enabled_site" || true
 
   # Generate report Site
   if ! report_generate_site "$enabled_site"; then

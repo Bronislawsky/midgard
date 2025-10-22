@@ -29,13 +29,13 @@ pull_sql_main() {
   if [[ -z "$site" ]]; then
     echo "pull_sql_main: missing site" >&2
     echo "$(midgard_current_time)  Remote Database Synchronisation [FAILED]" >> "$SITE_LOG_FILE"
-    echo "SQL" >> "$SITE_REPORT_FILE"
+    echo "SQL=FAIL" >> "$SITE_REPORT_FILE"
     return 1
   fi
 
   local assoc_name="${CONFIG_SITES[$site]:-}"
   if [[ -z "$assoc_name" ]]; then
-    echo "pulll_sql_main: site not loaded: $site" >&2
+    echo "pull_sql_main: site not loaded: $site" >&2
     echo "$(midgard_current_time)  Remote Database Synchronisation [FAILED]" >> "$SITE_LOG_FILE"
     echo "SQL=FAIL" >> "$SITE_REPORT_FILE"
     return 1

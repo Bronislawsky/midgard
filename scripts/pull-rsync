@@ -37,7 +37,7 @@ pull_rsync_main() {
 
   local assoc_name="${CONFIG_SITES[$site]:-}"
   if [[ -z "$assoc_name" ]]; then
-    echo "pulll_rsync_main: site not loaded: $site" >&2
+    echo "pull_rsync_main: site not loaded: $site" >&2
     echo "$(midgard_current_time)  Remote File Synchronisation [FAILED]" >> "$SITE_LOG_FILE"
     echo "RSYNC=FAIL" >> "$SITE_REPORT_FILE"
     return 1

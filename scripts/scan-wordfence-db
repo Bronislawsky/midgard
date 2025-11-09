@@ -212,6 +212,49 @@ SQL
     echo "$(midgard_current_time)    Suspicious posts : $prune_post" >> "$SITE_LOG_FILE"
   }
 
+  # ---- Preview suspicious posts: title + short content snippet ----
+  # Length of the content preview (can be overridden per-site in conf)
+  local PREVIEW_LEN="${WORDFENCE_DB_PREVIEW_LEN:-80}"
+
+  if [[ -n "${prune_post// }" ]]; then
+    echo -e "$(midgard_current_time) ${site}   Previewing suspicious posts (title + ${PREVIEW_LEN} chars):"
+    # Build a clean numeric list for the SQL IN() clause
+    local ids_csv=""
+    for one in $prune_post; do
+      [[ "$one" =~ ^[0-9]+$ ]] || continue
+      if [[ -z "$ids_csv" ]]; then ids_csv="$one"; else ids_csv+=",${one}"; fi
+    done
+
+    if [[ -n "$ids_csv" ]]; then
+      # Note: Use REPLACE(…, CHAR(10/13/9),' ') to flatten whitespace; LEFT() to clip.
+      # We avoid REGEXP_REPLACE for broad compatibility (MySQL 5.7 / older MariaDB).
+      local sql="
+        SELECT
+          ID,
+          post_type,
+          post_status,
+          LEFT(post_title, 200) AS title_short,
+          LEFT(
+            REPLACE(REPLACE(REPLACE(post_content, CHAR(10),' '), CHAR(13),' '), CHAR(9),' ')
+          , ${PREVIEW_LEN}) AS content_snippet
+        FROM \`${DB_PREFIX}posts\`
+        WHERE ID IN (${ids_csv})
+        ORDER BY ID ASC;
+      "
+
+      # -N -B => tab-separated, no headers. We read each row and pretty-print to console/log.
+      while IFS=$'\t' read -r pid ptype pstatus ptitle psnippet; do
+        [[ -z "$pid" ]] && continue
+        # Collapse repeated spaces in the snippet for readability.
+        local snippet_clean
+        snippet_clean="$(printf '%s' "$psnippet" | tr -s ' ')"
+
+        echo -e "$(midgard_current_time) ${site}     ↳ id ${c_yellow}${pid}${c_reset} [${ptype}/${pstatus}] title: ${c_light_blue}${ptitle}${c_reset} :: ${snippet_clean}"
+        echo "$(midgard_current_time)    Suspicious post preview | id=$pid | type=$ptype | status=$pstatus | title=$ptitle | snippet=$snippet_clean" >> "$SITE_LOG_FILE"
+      done < <(sudo -n "$MYSQL_BIN" -N -B "$DB_NAME" -e "$sql" 2>>"$SITE_LOG_FILE")
+    fi
+  fi
+
   # RC failed
   if (( $tmp_count != 0)); then
     echo -e "$(midgard_current_time) ${site} Wordfence-CLI Database Scan ${c_light_blue}[${c_light_red}FAILED${c_light_blue}]${c_reset}"

@@ -148,6 +148,11 @@ theme_checksums_main() {
   local SITE_LOG_FILE="${MIDGARD_SESSION_LOG_DIR}/${site}.log"
   local SITE_REPORT_FILE="${MIDGARD_SESSION_REPORT_DIR}/${site}.report"
 
+  # Theme info holder
+  local wp_theme=""
+  local wp_theme_version=""
+  local wp_themes_kv=""
+
   # Per-site toggle
   # Fetches the THEME_CHECKSUMS toggle from the site's config array.
   local THEME_CHECKSUMS="$(midgard_get_value_from_array "$assoc_name" THEME_CHECKSUMS)"
@@ -203,6 +208,17 @@ theme_checksums_main() {
         echo "$(midgard_current_time)     Could not determine the version of ${theme_slug}" >> "${SITE_LOG_FILE}"
         checksum_fail=1
         continue
+    fi
+
+    if [[ -z "$wp_themes_kv" ]]; then
+      wp_themes_kv="${theme_slug}:${theme_version}"
+    else
+      wp_themes_kv+=",${theme_slug}:${theme_version}"
+    fi
+
+    if [[ -z "$wp_theme" ]]; then
+      wp_theme="${theme_slug}"
+      wp_theme_version="${theme_version}"
     fi
 
     # Logs the start of checksum check for this theme.
@@ -312,6 +328,15 @@ theme_checksums_main() {
     rm -f "$json_file_list" "$local_file_list"
 
   done
+
+  # Themes info in report
+  if [[ -n "$wp_themes_kv" ]]; then
+    echo "WP_THEMES=${wp_themes_kv}" >> "${SITE_REPORT_FILE}"
+  fi
+  if [[ -n "$wp_theme" ]]; then
+    echo "WP_THEME=${wp_theme}" >> "${SITE_REPORT_FILE}"
+    [[ -n "$wp_theme_version" ]] && echo "WP_THEME_VERSION=${wp_theme_version}" >> "${SITE_REPORT_FILE}"
+  fi
 
   # Outputs final status to console and log file based on whether any failures occurred.
   echo -en "$(midgard_current_time) ${site}"

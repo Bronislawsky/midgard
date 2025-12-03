@@ -146,6 +146,9 @@ plugin_checksums_main() {
   local SITE_LOG_FILE="${MIDGARD_SESSION_LOG_DIR}/${site}.log"
   local SITE_REPORT_FILE="${MIDGARD_SESSION_REPORT_DIR}/${site}.report"
 
+  # Plugins name/version holder (slug:version,slug:version,...)
+  local wp_plugins_kv=""
+
   # Per-site toggle
   # Fetches the PLUGIN_CHECKSUMS toggle from the site's config array.
   local PLUGIN_CHECKSUMS="$(midgard_get_value_from_array "$assoc_name" PLUGIN_CHECKSUMS)"
@@ -201,6 +204,12 @@ plugin_checksums_main() {
         echo "$(midgard_current_time)     Could not determine the version of ${plugin_slug}" >> "${SITE_LOG_FILE}"
         checksum_fail=1
         continue
+    fi
+
+    if [[ -z "$wp_plugins_kv" ]]; then
+      wp_plugins_kv="${plugin_slug}:${plugin_version}"
+    else
+      wp_plugins_kv+=",${plugin_slug}:${plugin_version}"
     fi
 
     # Logs the start of checksum check for this plugin.
@@ -311,6 +320,10 @@ plugin_checksums_main() {
   echo -en "$(midgard_current_time) ${site}"
   echo -en "  Plugin checksums... "
   echo -n "$(midgard_current_time)   Plugin checksums... " >> "${SITE_LOG_FILE}"
+
+  if [[ -n "$wp_plugins_kv" ]]; then
+    echo "WP_PLUGINS=${wp_plugins_kv}" >> "${SITE_REPORT_FILE}"
+  fi
 
   if [[ ${checksum_fail:-0} -eq 0 ]]; then
     echo -e "${c_light_blue}[${c_green}SUCCESS${c_light_blue}]${c_reset}"

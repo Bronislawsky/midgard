@@ -302,6 +302,10 @@ wordpress_checksums_main() {
     echo "$(midgard_current_time)     Could not determine the WordPress version" >> "${SITE_LOG_FILE}"
     checksum_fail=1
   else
+
+    echo "WP_VERSION=${wp_version}" >> "${SITE_REPORT_FILE}"
+    [[ -n "$wp_locale" ]] && echo "WP_LOCALE=${wp_locale}" >> "${SITE_REPORT_FILE}"
+
     echo -e "$(midgard_current_time) ${site}    Checksum integrity check for WordPress core version ${c_yellow}${wp_version}${c_reset}${wp_locale:+ locale ${c_yellow}${wp_locale}${c_reset}}"
     echo "$(midgard_current_time)     Checksum integrity check for WordPress core version ${wp_version}${wp_locale:+ locale ${wp_locale}}" >> "${SITE_LOG_FILE}"
 

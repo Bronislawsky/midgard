@@ -1,0 +1,172 @@
+#!/usr/bin/env bash
+# file : ./scripts/pull-sql
+#------------------------------------------------------------------------------
+#
+#         .__    .___                      .___
+#   _____ |__| __| _/ _________ _______  __| _/
+#  /     \|  |/ __ | / ___\__  \\_  __ \/ __ |
+# |  Y Y  \  / /_/ |/ /_/  > __ \|  | \/ /_/ |
+# |__|_|  /__\____ |\___  (____  /__|  \____ |
+#       \/        \/_____/     \/           \/
+#
+# pull-sql — dump remote MySQL/MariaDB and save locally
+#------------------------------------------------------------------------------
+[[ "${MIDGARD_MAIN:-}" == "1" ]] || {
+  echo "This script must be sourced from the midgard launcher." >&2
+  return 1 2>/dev/null || exit 1
+}
+
+pull_sql_main() {
+  local site="$1"
+
+  mkdir -p "${MIDGARD_SESSION_LOG_DIR}" "${MIDGARD_SESSION_REPORT_DIR}"
+  local SITE_LOG_FILE="${MIDGARD_SESSION_LOG_DIR}/${site}.log"
+  local SITE_REPORT_FILE="${MIDGARD_SESSION_REPORT_DIR}/${site}.report"
+
+  echo -e "$(midgard_current_time) ${site} Remote Database Synchronisation ${c_light_blue}[${c_green}STARTED${c_light_blue}]${c_reset}"
+  echo "$(midgard_current_time) Remote Database Synchronisation [STARTED]" >> "$SITE_LOG_FILE"
+
+  if [[ -z "$site" ]]; then
+    echo "pull_sql_main: missing site" >&2
+    echo "$(midgard_current_time)  Remote Database Synchronisation [FAILED]" >> "$SITE_LOG_FILE"
+    echo "SQL=FAIL" >> "$SITE_REPORT_FILE"
+    return 1
+  fi
+
+  local assoc_name="${CONFIG_SITES[$site]:-}"
+  if [[ -z "$assoc_name" ]]; then
+    echo "pull_sql_main: site not loaded: $site" >&2
+    echo "$(midgard_current_time)  Remote Database Synchronisation [FAILED]" >> "$SITE_LOG_FILE"
+    echo "SQL=FAIL" >> "$SITE_REPORT_FILE"
+    return 1
+  fi
+
+  # Fetch SSH Related Fields
+  local REMOTE_USER REMOTE_HOST SSH_KEY_PRIV
+  REMOTE_USER="$(midgard_get_value_from_array "$assoc_name" REMOTE_USER)"
+  REMOTE_HOST="$(midgard_get_value_from_array "$assoc_name" REMOTE_HOST)"
+  SSH_KEY_PRIV="$(midgard_get_value_from_array "$assoc_name" SSH_KEY_PRIV)"
+
+  # Database related Path
+  local LOCAL_SYNC_PATH LOCAL_SQL_PATH LOCAL_SQL_FILE
+  LOCAL_SYNC_PATH="$(midgard_get_value_from_array "$assoc_name" LOCAL_SYNC_PATH)"
+  LOCAL_SQL_PATH="$(midgard_get_value_from_array "$assoc_name" LOCAL_SQL_PATH)"
+  LOCAL_SQL_FILE="$(midgard_get_value_from_array "$assoc_name" LOCAL_SQL_FILE)"
+
+  # SQL Credentials
+  local DB_USER DB_PASS DB_HOST DB_NAME
+  DB_USER="$(midgard_get_value_from_array "$assoc_name" DB_USER)"
+  DB_PASS="$(midgard_get_value_from_array "$assoc_name" DB_PASS)"
+  DB_HOST="$(midgard_get_value_from_array "$assoc_name" DB_HOST)"
+  DB_NAME="$(midgard_get_value_from_array "$assoc_name" DB_NAME)"
+
+  # local dump file/path
+  local LOCAL_SQL_DIR="${LOCAL_SYNC_PATH%/}${LOCAL_SQL_PATH}"
+  mkdir -p "$LOCAL_SQL_DIR"
+  local dest_tmp="${LOCAL_SQL_DIR%/}/${LOCAL_SQL_FILE}.tmp"
+  local dest_sql="${LOCAL_SQL_DIR%/}/${LOCAL_SQL_FILE}"
+
+  # sanity + env
+  local errors=()
+  [[ -n "$REMOTE_USER"     ]] || errors+=("REMOTE_USER")
+  [[ -n "$REMOTE_HOST"     ]] || errors+=("REMOTE_HOST")
+  [[ -r "$SSH_KEY_PRIV"    ]] || errors+=("SSH_KEY_PRIV")
+  [[ -n "$LOCAL_SYNC_PATH" ]] || errors+=("LOCAL_SYNC_PATH")
+  [[ -n "$LOCAL_SQL_PATH" ]]  || errors+=("LOCAL_SQL_PATH")
+  [[ -n "$LOCAL_SQL_FILE" ]]  || errors+=("LOCAL_SQL_FILE")
+  [[ -n "$DB_USER" ]]  || errors+=("DB_USER")
+  [[ -n "$DB_PASS" ]]  || errors+=("DB_PASS")
+  [[ -n "$DB_HOST" ]]  || errors+=("DB_HOST")
+  [[ -n "$DB_NAME" ]]  || errors+=("DB_NAME")
+
+  if (( ${#errors[@]} )); then
+    for err in "${errors[@]}"; do
+      echo -e "$(midgard_current_time) ${site}   Please verify ${c_light_red}${err}${c_reset}"
+    done
+
+    echo -e "$(midgard_current_time) ${site} Remote Database Synchronisation ${c_light_blue}[${c_light_red}FAILED${c_light_blue}]${c_reset}"
+    echo "$(midgard_current_time)  Remote Database Synchronisation [FAILED]" >> "$SITE_LOG_FILE"
+    echo "SQL=FAIL" >> "$SITE_REPORT_FILE"
+    return 1
+  fi
+
+  # ssh/scp opts
+  local SSH_OPTS=(-i "$SSH_KEY_PRIV" -o BatchMode=yes -o StrictHostKeyChecking=accept-new -o ConnectTimeout=15)
+  local SCP_OPTS=(-i "$SSH_KEY_PRIV" -o BatchMode=yes -o StrictHostKeyChecking=accept-new -o ConnectTimeout=15 -q)
+
+  # Ensure remote tmp dir
+  local remote_tmp_dir
+  if ! remote_tmp_dir="$(
+    ssh -T "${SSH_OPTS[@]}" "${REMOTE_USER}@${REMOTE_HOST}" \
+      'mkdir -p "$HOME/.tmp-backup" && chmod 700 "$HOME/.tmp-backup" && printf "%s" "$HOME/.tmp-backup"' \
+      </dev/null 2>>"$SITE_LOG_FILE"
+
+
+  )"; then
+    echo -e "$(midgard_current_time) ${site}   ${c_light_red}Cannot create/access tmp dir${c_reset}"
+    echo "$(midgard_current_time)    Cannot create/access tmp dir"  >> "$SITE_LOG_FILE"
+    echo -e "$(midgard_current_time) ${site} Remote Database Synchronisation ${c_light_blue}[${c_light_red}FAILED${c_light_blue}]${c_reset}"
+    echo "$(midgard_current_time)  Remote Database Synchronisation [FAILED]" >> "$SITE_LOG_FILE"
+    echo "SQL=FAIL" >> "$SITE_REPORT_FILE"
+    return 1
+  fi
+
+  # Create local temp .my.cnf and upload securely
+  umask 077
+  local local_mycnf;
+  local_mycnf="$(mktemp "/tmp/.my.cnf-${site}.XXXXXX")"
+
+cat >"$local_mycnf" <<EOF
+[client]
+user=$DB_USER
+password=$DB_PASS
+host=$DB_HOST
+EOF
+  chmod 600 "$local_mycnf"
+
+  local ts;
+  ts="$(date +%Y%m%d-%H%M%S)"
+  local remote_mycnf="${remote_tmp_dir}/.my.cnf-${ts}-$$"
+
+  if ! scp "${SCP_OPTS[@]}" -- "$local_mycnf" "${REMOTE_USER}@${REMOTE_HOST}:${remote_mycnf}" 2>>"$SITE_LOG_FILE"; then
+    rm -f "$local_mycnf"
+    echo -e "$(midgard_current_time) ${site}   ${c_light_red}Failed to upload credentials file${c_reset}"
+    echo "$(midgard_current_time)    Failed to upload credentials file"  >> "$SITE_LOG_FILE"
+    echo -e "$(midgard_current_time) ${site} Remote Database Synchronisation ${c_light_blue}[${c_light_red}FAILED${c_light_blue}]${c_reset}"
+    echo "$(midgard_current_time)  Remote Database Synchronisation [FAILED]" >> "$SITE_LOG_FILE"
+    echo "SQL=FAIL" >> "$SITE_REPORT_FILE"
+    return 1
+  fi
+
+  rm -f "$local_mycnf" 2>/dev/null || true
+
+  # Run mysqldump on remote using --defaults-extra-file, stream to local tmp
+  if ssh -T "${SSH_OPTS[@]}" "${REMOTE_USER}@${REMOTE_HOST}" \
+    "MD=\$(command -v mysqldump || true); : \${MD:=mysqldump}; \"\$MD\" --defaults-extra-file=$(printf %q "$remote_mycnf") --single-transaction --default-character-set=utf8mb4 --skip-lock-tables $(printf %q "$DB_NAME")" \
+        | tee "$dest_tmp" >/dev/null 2>>"$SITE_LOG_FILE"
+  then
+    mv -f "$dest_tmp" "$dest_sql"
+    chmod 640 "$dest_sql"
+    echo -e "$(midgard_current_time) ${site}   SQL Dump saved to : ${c_light_blue}$dest_sql${c_reset}"
+    echo "$(midgard_current_time)    SQL Dump saved to : $dest_sql" >> "$SITE_LOG_FILE"
+    echo -e "$(midgard_current_time) ${site} Remote Database Synchronisation ${c_light_blue}[${c_green}SUCCESS${c_light_blue}]${c_reset}"
+    echo "$(midgard_current_time) Remote Database Synchronisation [SUCCESS]" >> "$SITE_LOG_FILE"
+    echo "SQL=OK" >> "$SITE_REPORT_FILE"
+    # cleanup remote temp file (leave dir for reuse)
+    ssh -T "${SSH_OPTS[@]}" "${REMOTE_USER}@${REMOTE_HOST}" "rm -f -- $(printf %q "$remote_mycnf")" </dev/null 2>>"$SITE_LOG_FILE" || true
+    return 0
+  else
+    rc=$?
+    echo -e "$(midgard_current_time) ${site}   ${c_light_red}Failed to Dump Database${c_reset}"
+    echo "$(midgard_current_time)    Failed to Dump Database"  >> "$SITE_LOG_FILE"
+    echo -e "$(midgard_current_time) ${site} Remote Database Synchronisation ${c_light_blue}[${c_light_red}FAILED${c_light_blue}]${c_reset}"
+    echo "$(midgard_current_time)  Remote Database Synchronisation [FAILED]" >> "$SITE_LOG_FILE"
+    [[ -f "$dest_tmp" ]] && rm -f "$dest_tmp"
+    echo "SQL=FAIL" >> "$SITE_REPORT_FILE"
+    # attempt cleanup even on failure
+    ssh -T "${SSH_OPTS[@]}" "${REMOTE_USER}@${REMOTE_HOST}" "rm -f -- $(printf %q "$remote_mycnf")" </dev/null 2>>"$SITE_LOG_FILE" || true
+    return 1
+  fi
+
+  return 0
+}

@@ -1,0 +1,171 @@
+#!/usr/bin/env bash
+# file : ./scripts/inspect-site
+#------------------------------------------------------------------------------
+#
+#         .__    .___                      .___
+#   _____ |__| __| _/ _________ _______  __| _/
+#  /     \|  |/ __ | / ___\__  \\_  __ \/ __ |
+# |  Y Y  \  / /_/ |/ /_/  > __ \|  | \/ /_/ |
+# |__|_|  /__\____ |\___  (____  /__|  \____ |
+#       \/        \/_____/     \/           \/
+#
+# inspect-site — validate a site's config & runtime materialization
+#   - must be sourced by ./midgard (MIDGARD_MAIN=1)
+#   - expects helper loaded (status_start/ok/fail, info) and midgard.conf (GPG_BIN)
+#   - optional arg "skip-encrypt" disables decrypt/compare (for cron)
+#------------------------------------------------------------------------------
+
+[[ "${MIDGARD_MAIN:-}" == "1" ]] || {
+  echo "This script must be sourced from the midgard launcher." >&2
+  return 1 2>/dev/null || exit 1
+}
+
+# ------- small utils -------
+_trim_quotes() { sed -E 's/^"(.*)"$/\1/'; }
+
+_dec_inline() {  # $1=key, $2=base64 -> stdout=plaintext (or fail)
+  local _k="$1" _b64="$2"; exec 3<<<"$_k"
+  printf %s "$_b64" | base64 -d 2>/dev/null | \
+    "${GPG_BIN:?GPG_BIN not set}" --batch --yes --quiet --pinentry-mode loopback \
+    --passphrase-fd 3 --decrypt 2>/dev/null
+  local rc=$?; exec 3<&-; return $rc
+}
+
+_enforce_perm() { # $1=mode $2=path  (quiet on success)
+  local m="$1" p="$2"
+  [[ -e "$p" ]] || { ERRORS+=("missing ${p}"); return 0; }
+  chmod "$m" "$p" 2>/dev/null || ERRORS+=("chmod $m failed on ${p}")
+}
+
+_read_kv_file() { # $1=file  $2=regex (keys)
+  local f="$1" re="$2" k v
+  [[ -r "$f" ]] || return 1
+  while IFS='=' read -r k v; do
+    [[ "$k" =~ $re ]] || continue
+    v="${v%\"}"; v="${v#\"}"
+    printf '%s\1%s\n' "$k" "$v"
+  done <"$f"
+}
+
+_cmp() { # $1=label $2=expected $3=actual
+  local label="$1" exp="$2" act="$3"
+  [[ "$exp" == "$act" ]] || ERRORS+=("mismatch $label (config≠plaintext)")
+}
+
+# ------- main function (not auto-run) -------
+inspect_site_main() {
+  local site="${1-}"
+  local mode="${2-}"   # optional: "skip-encrypt"
+  if [[ -z "$site" ]]; then
+    echo "Usage: ./midgard inspect-site <site> [skip-encrypt]" >&2
+    return 1
+  fi
+  local skip_encrypt="n"
+  [[ "$mode" == "skip-encrypt" ]] && skip_encrypt="y"
+
+  local script_dir root_dir conf_dir data_dir conf_file
+  script_dir="$(cd -- "$(dirname "${BASH_SOURCE[0]}")" &>/dev/null; pwd -P)"
+  root_dir="$(cd -- "${script_dir}/.." &>/dev/null; pwd -P)"
+  conf_dir="${root_dir}/sites-available"
+  data_dir="${root_dir}/sites-data/${site}"
+  conf_file="${conf_dir}/${site}.conf"
+
+  local -a ERRORS=()
+
+  status_start " Inspecting site ${site}"; echo
+
+  # --- load site conf ---
+  status_start "   Reading site config ${conf_file} ..."
+  if [[ ! -f "$conf_file" ]]; then status_fail; echo "    - site config not found"; return 1; fi
+  # shellcheck disable=SC1090
+  if ! source "$conf_file"; then status_fail; echo "    - could not source site config"; return 1; fi
+
+  # --- required (presence only) ---
+  local REQ=( SITE REMOTE_USER REMOTE_HOST REMOTE_PATH
+              LOCAL_SYNC_PATH LOCAL_ARCHIVE_PATH LOCAL_SQL_PATH LOCAL_SQL_FILE LOCAL_DOCUMENT_ROOT )
+  if [[ "$skip_encrypt" != "y" ]]; then
+    REQ+=( DB_USER DB_PASS DB_HOST DB_NAME DB_PREFIX
+           AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_S3_BUCKET AWS_REGION AWS_S3_PATH AWS_RESTIC_PASSWORD )
+  fi
+  for v in "${REQ[@]}"; do
+    [[ -n "${!v:-}" ]] || ERRORS+=("missing $v in site config")
+  done
+  if (( ${#ERRORS[@]} )); then status_fail; for e in "${ERRORS[@]}"; do echo "    - $e"; done; return 1; else status_ok; fi
+
+  # --- files exist ---
+  status_start "   Validating sites-data files exist ..."
+  local aws="${data_dir}/aws-credentials"
+  local mysql="${data_dir}/mysql-credentials"
+  local pass="${data_dir}/restic.pass"
+  [[ -r "$aws"  ]] || ERRORS+=("missing ${aws}")
+  [[ -r "$mysql" ]] || ERRORS+=("missing ${mysql}")
+  [[ -r "$pass"  ]] || ERRORS+=("missing ${pass}")
+  if (( ${#ERRORS[@]} )); then status_fail; for e in "${ERRORS[@]}"; do echo "    - $e"; done; return 1; else status_ok; fi
+
+  # --- decrypt & compare (skippable) ---
+  if [[ "$skip_encrypt" != "y" ]]; then
+    status_start "Decrypting secrets and cross-checking with plaintext ...\n"
+    local key
+    read -rs -p "Encryption Key : " key; echo
+
+    # Decrypt
+    local dec_DB_USER dec_DB_PASS dec_DB_HOST dec_DB_NAME dec_DB_PREFIX
+    local dec_AWS_ACCESS_KEY_ID dec_AWS_SECRET_ACCESS_KEY dec_AWS_S3_BUCKET dec_AWS_REGION dec_AWS_S3_PATH dec_AWS_RESTIC_PASSWORD
+    [[ -n "${DB_USER:-}" ]]  && ! dec_DB_USER="$(_dec_inline "$key" "$(printf %s "$DB_USER" | _trim_quotes)")" && ERRORS+=("bad key? cannot decrypt DB_USER")
+    [[ -n "${DB_PASS:-}" ]]  && ! dec_DB_PASS="$(_dec_inline "$key" "$(printf %s "$DB_PASS" | _trim_quotes)")" && ERRORS+=("bad key? cannot decrypt DB_PASS")
+    [[ -n "${DB_HOST:-}" ]]  && ! dec_DB_HOST="$(_dec_inline "$key" "$(printf %s "$DB_HOST" | _trim_quotes)")" && ERRORS+=("bad key? cannot decrypt DB_HOST")
+    [[ -n "${DB_NAME:-}" ]]  && ! dec_DB_NAME="$(_dec_inline "$key" "$(printf %s "$DB_NAME" | _trim_quotes)")" && ERRORS+=("bad key? cannot decrypt DB_NAME")
+    [[ -n "${DB_PREFIX:-}" ]]&& ! dec_DB_PREFIX="$(_dec_inline "$key" "$(printf %s "$DB_PREFIX" | _trim_quotes)")"&& ERRORS+=("bad key? cannot decrypt DB_PREFIX")
+
+    [[ -n "${AWS_ACCESS_KEY_ID:-}" ]]     && ! dec_AWS_ACCESS_KEY_ID="$(_dec_inline "$key" "$(printf %s "$AWS_ACCESS_KEY_ID" | _trim_quotes)")" && ERRORS+=("bad key? cannot decrypt AWS_ACCESS_KEY_ID")
+    [[ -n "${AWS_SECRET_ACCESS_KEY:-}" ]] && ! dec_AWS_SECRET_ACCESS_KEY="$(_dec_inline "$key" "$(printf %s "$AWS_SECRET_ACCESS_KEY" | _trim_quotes)")" && ERRORS+=("bad key? cannot decrypt AWS_SECRET_ACCESS_KEY")
+    [[ -n "${AWS_S3_BUCKET:-}" ]]         && ! dec_AWS_S3_BUCKET="$(_dec_inline "$key" "$(printf %s "$AWS_S3_BUCKET" | _trim_quotes)")" && ERRORS+=("bad key? cannot decrypt AWS_S3_BUCKET")
+    [[ -n "${AWS_REGION:-}" ]]            && ! dec_AWS_REGION="$(_dec_inline "$key" "$(printf %s "$AWS_REGION" | _trim_quotes)")" && ERRORS+=("bad key? cannot decrypt AWS_REGION")
+    [[ -n "${AWS_S3_PATH:-}" ]]           && ! dec_AWS_S3_PATH="$(_dec_inline "$key" "$(printf %s "$AWS_S3_PATH" | _trim_quotes)")" && ERRORS+=("bad key? cannot decrypt AWS_S3_PATH")
+    [[ -n "${AWS_RESTIC_PASSWORD:-}" ]]   && ! dec_AWS_RESTIC_PASSWORD="$(_dec_inline "$key" "$(printf %s "$AWS_RESTIC_PASSWORD" | _trim_quotes)")" && ERRORS+=("bad key? cannot decrypt AWS_RESTIC_PASSWORD")
+
+    # Parse plaintext
+    declare -A AWS_PLAIN=()
+    while IFS=$'\1' read -r k v; do AWS_PLAIN["$k"]="$v"; done < <(
+      _read_kv_file "$aws" '^(AWS_ACCESS_KEY_ID|AWS_SECRET_ACCESS_KEY|AWS_DEFAULT_REGION|AWS_S3_BUCKET|AWS_S3_PATH)$'
+    )
+    declare -A DB_PLAIN=()
+    while IFS=$'\1' read -r k v; do DB_PLAIN["$k"]="$v"; done < <(
+      _read_kv_file "$mysql" '^(DB_USER|DB_PASS|DB_HOST|DB_NAME|DB_PREFIX)$'
+    )
+    local restic_plain; restic_plain="$(cat "$pass" 2>/dev/null || true)"
+
+    # Compare
+    _cmp "DB_USER"   "${dec_DB_USER-}"   "${DB_PLAIN[DB_USER]-}"
+    _cmp "DB_PASS"   "${dec_DB_PASS-}"   "${DB_PLAIN[DB_PASS]-}"
+    _cmp "DB_HOST"   "${dec_DB_HOST-}"   "${DB_PLAIN[DB_HOST]-}"
+    _cmp "DB_NAME"   "${dec_DB_NAME-}"   "${DB_PLAIN[DB_NAME]-}"
+    _cmp "DB_PREFIX" "${dec_DB_PREFIX-}" "${DB_PLAIN[DB_PREFIX]-}"
+
+    _cmp "AWS_ACCESS_KEY_ID"     "${dec_AWS_ACCESS_KEY_ID-}"     "${AWS_PLAIN[AWS_ACCESS_KEY_ID]-}"
+    _cmp "AWS_SECRET_ACCESS_KEY" "${dec_AWS_SECRET_ACCESS_KEY-}" "${AWS_PLAIN[AWS_SECRET_ACCESS_KEY]-}"
+    _cmp "AWS_DEFAULT_REGION"    "${dec_AWS_REGION-}"            "${AWS_PLAIN[AWS_DEFAULT_REGION]-}"
+    _cmp "AWS_S3_BUCKET"         "${dec_AWS_S3_BUCKET-}"         "${AWS_PLAIN[AWS_S3_BUCKET]-}"
+    _cmp "AWS_S3_PATH"           "${dec_AWS_S3_PATH-}"           "${AWS_PLAIN[AWS_S3_PATH]-}"
+
+    _cmp "RESTIC_PASSWORD_FILE content" "${dec_AWS_RESTIC_PASSWORD-}" "${restic_plain-}"
+
+    if (( ${#ERRORS[@]} )); then status_fail; for e in "${ERRORS[@]}"; do echo "    - $e"; done; return 1; else status_ok; fi
+  fi
+
+  # --- enforce permissions (quiet unless failure) ---
+  status_start "   Enforcing permissions for ${site} ..."
+  [[ -d "$data_dir" ]] || ERRORS+=("missing ${data_dir}")
+  _enforce_perm 600 "$data_dir/restic.pass"
+  _enforce_perm 640 "$data_dir/aws-credentials"
+  _enforce_perm 640 "$data_dir/mysql-credentials"
+  [[ -e "$data_dir/id_rsa"     ]] && _enforce_perm 600 "$data_dir/id_rsa"
+  [[ -e "$data_dir/id_rsa.pub" ]] && _enforce_perm 644 "$data_dir/id_rsa.pub"
+
+  if (( ${#ERRORS[@]} )); then
+    status_fail; for e in "${ERRORS[@]}"; do echo "    - $e"; done; return 1
+  else
+    status_ok
+    return 0
+  fi
+}

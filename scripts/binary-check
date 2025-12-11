@@ -1,0 +1,140 @@
+#!/usr/bin/env bash
+# file : ./scripts/binary-check
+#------------------------------------------------------------------------------
+#         .__    .___                      .___
+#   _____ |__| __| _/ _________ _______  __| _/
+#  /     \|  |/ __ | / ___\__  \\_  __ \/ __ |
+# |  Y Y  \  / /_/ |/ /_/  > __ \|  | \/ /_/ |
+# |__|_|  /__\____ |\___  (____  /__|  \____ |
+#       \/        \/_____/     \/           \/
+# bincheck — verify required binaries & sudo -n capability
+#------------------------------------------------------------------------------
+
+# Enforce: only usable when sourced by the main launcher
+if [[ "${MIDGARD_MAIN:-}" != "1" ]]; then
+  echo "This script must be sourced from the midgard launcher." >&2
+  return 1 2>/dev/null || exit 1
+fi
+
+# Assumes helper + config already sourced by main
+
+ERRORS=()
+
+# --- 1) Basic executables presence ---
+status_start "Checking binary paths ..."
+REQUIRED_BINS=(
+  MYSQL_BIN
+  RSYNC_BIN
+  RESTIC_BIN
+  FRESHCLAM
+  CLAMDSCAN_BIN
+  WORDFENCE_BIN
+  WEASYPRINT_BIN
+  MALDET_BIN
+  TAR_BIN
+  GPG_BIN
+)
+
+for v in "${REQUIRED_BINS[@]}"; do
+  p="${!v:-}"
+  if [[ -z "$p" ]]; then
+    ERRORS+=("missing path for $v")
+    continue
+  fi
+  # Expand ~ in paths like $HOME/.local/bin/wordfence
+  # shellcheck disable=SC2086
+  eval ep="$p"
+  if [[ ! -x "$ep" ]]; then
+    ERRORS+=("$v points to non-executable or missing file: $p")
+  fi
+done
+
+if (( ${#ERRORS[@]} > 0 )); then
+  status_fail
+  for e in "${ERRORS[@]}"; do echo "    - $e"; done
+  return 1 2>/dev/null || exit 1
+else
+  status_ok
+fi
+
+# --- 2) sudo -n checks where required ---
+status_start "Checking sudo -n for privileged commands ..."
+
+SUDO_REQUIRED_BINS=( MYSQL_BIN MALDET_BIN FRESHCLAM CLAMDSCAN_BIN )
+
+# Safe flags per tool (no side effects)
+declare -A VERSION_FLAG=(
+  [MYSQL_BIN]="--version"
+  [MALDET_BIN]="--help"
+  [FRESHCLAM]="--version"
+  [CLAMDSCAN_BIN]="--version"
+)
+
+SUDO_ERRORS=()
+
+# If sudo is missing entirely, fail with guidance
+if ! command -v sudo >/dev/null 2>&1; then
+  status_fail
+  echo "    - sudo not found in PATH"
+  echo "      Install sudo and create a sudoers.d drop-in for non-interactive runs."
+  return 1 2>/dev/null || exit 1
+fi
+
+for v in "${SUDO_REQUIRED_BINS[@]}"; do
+  p="${!v}"
+  # Expand ~ if present
+  eval ep="$p"
+  f="${VERSION_FLAG[$v]}"
+
+  # Skip if the path itself was already flagged missing in step 1
+  if [[ ! -x "$ep" ]]; then
+    SUDO_ERRORS+=("cannot test sudo for $v because binary path is invalid: $ep")
+    continue
+  fi
+
+  if ! sudo -n "$ep" $f >/dev/null 2>&1; then
+    SUDO_ERRORS+=("sudo -n denied for $v ($ep) with '$f'")
+  fi
+done
+
+if (( ${#SUDO_ERRORS[@]} > 0 )); then
+  status_fail
+  for e in "${SUDO_ERRORS[@]}"; do
+    echo "    - $e"
+  done
+
+  # ---- Actionable guidance to create sudoers.d drop-in ----
+  echo
+  echo "To allow non-interactive sudo for required commands, create a sudoers.d file:"
+  this_user="$(id -un)"
+  drop_file="/etc/sudoers.d/midgard-${this_user}"
+
+  echo "  sudo visudo -f ${drop_file}"
+  echo "with the following content:"
+  echo
+  cat <<EOF
+User_Alias MIDGARD_USER = ${this_user}
+Cmnd_Alias MIDGARD_CMDS = \\
+    ${MYSQL_BIN%% *}, \\
+    ${MALDET_BIN%% *}, \\
+    ${FRESHCLAM%% *}, \\
+    ${CLAMDSCAN_BIN%% *}
+
+MIDGARD_USER ALL=(root) NOPASSWD: MIDGARD_CMDS
+Defaults:${this_user} !requiretty
+EOF
+  echo
+  echo "Notes:"
+  echo "  - Paths must be absolute and match exactly."
+  echo "  - We allow the command paths without arguments; this permits safe flags like '--version'."
+  echo "  - Verify with:  sudo -n ${FRESHCLAM%% *} --version"
+  echo "                  sudo -n ${CLAMDSCAN_BIN%% *} --version"
+  echo "                  sudo -n ${MALDET_BIN%% *} --help"
+  echo "                  sudo -n ${MYSQL_BIN%% *} --version"
+  echo "  - Audit your policy with: sudo -n -l"
+  echo
+
+  return 1 2>/dev/null || exit 1
+else
+  status_ok
+fi

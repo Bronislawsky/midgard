@@ -1,0 +1,149 @@
+#!/usr/bin/env bash
+# file : ./scripts/site-load
+#------------------------------------------------------------------------------
+#
+#         .__    .___                      .___
+#   _____ |__| __| _/ _________ _______  __| _/
+#  /     \|  |/ __ | / ___\__  \\_  __ \/ __ |
+# |  Y Y  \  / /_/ |/ /_/  > __ \|  | \/ /_/ |
+# |__|_|  /__\____ |\___  (____  /__|  \____ |
+#       \/        \/_____/     \/           \/
+#
+# site-load — list enabled sites & load one site's settings into an assoc array
+#   - requires MIDGARD_MAIN=1, helper/status_* already sourced
+#------------------------------------------------------------------------------
+
+[[ "${MIDGARD_MAIN:-}" == "1" ]] || {
+  echo "This script must be sourced from the midgard launcher." >&2
+  return 1 2>/dev/null || exit 1
+}
+
+# paths helper
+_sl_paths() {
+  local script_dir root_dir conf_dir enabled_dir data_dir
+  script_dir="$(cd -- "$(dirname "${BASH_SOURCE[0]}")" &>/dev/null; pwd -P)"
+  root_dir="$(cd -- "${script_dir}/.." &>/dev/null; pwd -P)"
+  conf_dir="${root_dir}/sites-available"
+  enabled_dir="${root_dir}/sites-enabled"
+  data_dir="${root_dir}/sites-data"
+  echo "$root_dir" "$conf_dir" "$enabled_dir" "$data_dir"
+}
+
+# List enabled sites (by symlinks in sites-enabled). Prints one site per line.
+site_enabled_list() {
+  local _r _c _e _d
+  read -r _r _c _e _d < <(_sl_paths)
+  shopt -s nullglob
+  for f in "${_e}"/*.conf; do
+    [[ -L "$f" ]] || continue
+    base="$(basename "$f")"
+    [[ "$base" == "example.com.conf" ]] && continue
+    echo "${base%.conf}"
+  done
+  shopt -u nullglob
+}
+
+# Lightweight KEY=VAL reader (quoted or not)
+_sl_read_kv_file() { # $1=file  $2=regex(keys)
+  local f="$1" re="$2" k v
+  [[ -r "$f" ]] || return 1
+  while IFS='=' read -r k v; do
+    [[ "$k" =~ $re ]] || continue
+    v="${v%\"}"; v="${v#\"}"
+    printf '%s\1%s\n' "$k" "$v"
+  done <"$f"
+}
+
+# Load one site's settings into an associative array whose name is passed as $2.
+# Usage: site_load_into "example.com" "SITES_example_com"
+site_load_into() { # $1=site  $2=array_name
+  local site="$1" arr_name="$2"
+  [[ -n "$site" && -n "$arr_name" ]] || { echo "site_load_into <site> <array_name>"; return 1; }
+
+  local _r _c _e _d conf data aws mysql pass
+  read -r _r _c _e _d < <(_sl_paths)
+  conf="${_c}/${site}.conf"
+  data="${_d}/${site}"
+  aws="${data}/aws-credentials"
+  mysql="${data}/mysql-credentials"
+  pass="${data}/restic.pass"
+
+  # shellcheck disable=SC2034,SC1090
+  if [[ -f "$conf" ]]; then source "$conf"; else echo "missing site config: $conf" >&2; return 1; fi
+
+  # Ensure assoc array exists
+  eval "declare -gA ${arr_name}=()"
+
+  # Non-secret directly from config
+  eval "${arr_name}[SITE]=\"${SITE:-$site}\""
+  eval "${arr_name}[REMOTE_USER]=\"${REMOTE_USER:-}\""
+  eval "${arr_name}[REMOTE_HOST]=\"${REMOTE_HOST:-}\""
+  eval "${arr_name}[REMOTE_PATH]=\"${REMOTE_PATH:-}\""
+  eval "${arr_name}[INCLUDE_DIRS]=\"${INCLUDE_DIRS:-}\""
+  eval "${arr_name}[IGNORE_DIRS]=\"${IGNORE_DIRS:-}\""
+  eval "${arr_name}[LOCAL_SYNC_PATH]=\"${LOCAL_SYNC_PATH:-}\""
+  eval "${arr_name}[LOCAL_ARCHIVE_PATH]=\"${LOCAL_ARCHIVE_PATH:-}\""
+  eval "${arr_name}[LOCAL_SQL_PATH]=\"${LOCAL_SQL_PATH:-}\""
+  eval "${arr_name}[LOCAL_SQL_FILE]=\"${LOCAL_SQL_FILE:-}\""
+  eval "${arr_name}[LOCAL_DOCUMENT_ROOT]=\"${LOCAL_DOCUMENT_ROOT:-}\""
+  eval "${arr_name}[LOCAL_ARCHIVE_RETENTION_DAYS]=\"${LOCAL_ARCHIVE_RETENTION_DAYS:-}\""
+  eval "${arr_name}[RESTIC_RETENTION_DAYS]=\"${RESTIC_RETENTION_DAYS:-}\""
+  eval "${arr_name}[LOG_RETENTION_DAYS]=\"${LOG_RETENTION_DAYS:-}\""
+  eval "${arr_name}[CLAMAV_ENABLE]=\"${CLAMAV_ENABLE:-}\""
+  eval "${arr_name}[MALDET_ENABLE]=\"${MALDET_ENABLE:-}\""
+  eval "${arr_name}[MALDET_IGNORE_IMAGES]=\"${MALDET_IGNORE_IMAGES:-}\""
+  eval "${arr_name}[WORDFENCE_ENABLE]=\"${WORDFENCE_ENABLE:-}\""
+  eval "${arr_name}[WORDFENCE_VULN_ENABLE]=\"${WORDFENCE_VULN_ENABLE:-}\""
+  eval "${arr_name}[WORDFENCE_ENABLE_DB]=\"${WORDFENCE_ENABLE_DB:-}\""
+  eval "${arr_name}[WORDFENCE_DB_REMOVE_POST]=\"${WORDFENCE_DB_REMOVE_POST:-}\""
+  eval "${arr_name}[UPLOADS_PHP_ENABLE]=\"${UPLOADS_PHP_ENABLE:-}\""
+  eval "${arr_name}[UPLOADS_PHP_CHECKSUMS_UNEXPECTED_FILES]=\"${UPLOADS_PHP_CHECKSUMS_UNEXPECTED_FILES:-}\""
+  eval "${arr_name}[PLUGIN_CHECKSUMS]=\"${PLUGIN_CHECKSUMS:-}\""
+  eval "${arr_name}[THEME_CHECKSUMS]=\"${THEME_CHECKSUMS:-}\""
+  eval "${arr_name}[WORDPRESS_CHECKSUMS]=\"${WORDPRESS_CHECKSUMS:-}\""
+  eval "${arr_name}[WORDPRESS_CHECKSUMS_IGNORE_PATH]=\"${WORDPRESS_CHECKSUMS_IGNORE_PATH:-}\""
+  eval "${arr_name}[WORDPRESS_CHECKSUMS_UNEXPECTED_FILES]=\"${WORDPRESS_CHECKSUMS_UNEXPECTED_FILES:-}\""
+  eval "${arr_name}[WORDPRESS_CHECKSUMS_ALLOWED_MISSING]=\"${WORDPRESS_CHECKSUMS_ALLOWED_MISSING:-}\""
+  eval "${arr_name}[REPORTING_ENABLE]=\"${REPORTING_ENABLE:-}\""
+  eval "${arr_name}[REPORTING_EMAILS]=\"${REPORTING_EMAILS:-}\""
+  eval "${arr_name}[LOCAL_ARCHIVE]=\"${LOCAL_ARCHIVE:-}\""
+
+  # Paths
+  eval "${arr_name}[DATA_DIR]=\"${data}\""
+  eval "${arr_name}[CONF_FILE]=\"${conf}\""
+  eval "${arr_name}[AWS_FILE]=\"${aws}\""
+  eval "${arr_name}[MYSQL_FILE]=\"${mysql}\""
+  eval "${arr_name}[RESTIC_FILE]=\"${pass}\""
+  [[ -f "${data}/id_rsa"     ]] && eval "${arr_name}[SSH_KEY_PRIV]=\"${data}/id_rsa\""
+  [[ -f "${data}/id_rsa.pub" ]] && eval "${arr_name}[SSH_KEY_PUB]=\"${data}/id_rsa.pub\""
+
+  # Secrets from plaintext files (no key required)
+  # mysql-credentials
+  if [[ -r "$mysql" ]]; then
+    while IFS=$'\1' read -r k v; do
+      case "$k" in
+        DB_USER|DB_PASS|DB_HOST|DB_NAME|DB_PREFIX)
+          eval "${arr_name}[${k}]=\"${v}\""
+        ;;
+      esac
+    done < <(_sl_read_kv_file "$mysql" '^(DB_USER|DB_PASS|DB_HOST|DB_NAME|DB_PREFIX)$')
+  fi
+
+  # aws-credentials
+  if [[ -r "$aws" ]]; then
+    while IFS=$'\1' read -r k v; do
+      case "$k" in
+        AWS_ACCESS_KEY_ID|AWS_SECRET_ACCESS_KEY|AWS_DEFAULT_REGION|AWS_S3_BUCKET|AWS_S3_PATH)
+          eval "${arr_name}[${k}]=\"${v}\""
+        ;;
+      esac
+    done < <(_sl_read_kv_file "$aws" '^(AWS_ACCESS_KEY_ID|AWS_SECRET_ACCESS_KEY|AWS_DEFAULT_REGION|AWS_S3_BUCKET|AWS_S3_PATH)$')
+  fi
+
+  # restic.pass
+  if [[ -r "$pass" ]]; then
+    local rp; rp="$(cat "$pass" 2>/dev/null || true)"
+    eval "${arr_name}[RESTIC_PASSWORD]=\"${rp}\""
+  fi
+}
+# (EOF) functions only; no auto-exec

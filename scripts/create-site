@@ -1,0 +1,413 @@
+#!/usr/bin/env bash
+# file : ./scripts/create-site
+#------------------------------------------------------------------------------
+#
+#         .__    .___                      .___
+#   _____ |__| __| _/ _________ _______  __| _/
+#  /     \|  |/ __ | / ___\__  \\_  __ \/ __ |
+# |  Y Y  \  / /_/ |/ /_/  > __ \|  | \/ /_/ |
+# |__|_|  /__\____ |\___  (____  /__|  \____ |
+#       \/        \/_____/     \/           \/
+#
+# create-site — interactively create/update sites-available/<site>.conf
+#   - must be sourced by ./midgard (MIDGARD_MAIN=1)
+#   - expects midgard.conf to be loaded already (GPG_BIN & PRESET_* vars)
+#------------------------------------------------------------------------------
+
+if [[ "${MIDGARD_MAIN:-}" != "1" ]]; then
+  echo "This script must be sourced from the midgard launcher." >&2
+  return 1 2>/dev/null || exit 1
+fi
+
+# 64-char random [A-Za-z0-9] (for restic password suggestions)
+_rand64() {
+  tr -dc 'A-Za-z0-9' </dev/urandom | head -c 64 || true
+}
+
+# ---- inline enc/dec using GnuPG AES256 with configured GPG_BIN ----
+_enc_inline() {  # $1=key, stdin=plaintext -> stdout=base64
+  local _k="$1"; exec 3<<<"$_k"
+  "${GPG_BIN:?GPG_BIN not set}" --batch --yes --pinentry-mode loopback --passphrase-fd 3 \
+    --symmetric --cipher-algo AES256 | base64 -w0
+  exec 3<&-
+}
+_dec_inline() {  # $1=key, $2=base64 -> stdout=plaintext (or fail)
+  local _k="$1" _b64="$2"; exec 3<<<"$_k"
+  printf %s "$_b64" | base64 -d 2>/dev/null | \
+    "${GPG_BIN:?GPG_BIN not set}" --batch --yes --pinentry-mode loopback --passphrase-fd 3 --decrypt
+  local rc=$?; exec 3<&-; return $rc
+}
+
+# -------- helpers --------
+_trim_quotes() { sed -E 's/^"(.*)"$/\1/'; }
+_escape_val() { local s="${1:-}"; s="${s//\\/\\\\}"; s="${s//\"/\\\"}"; printf '"%s"' "$s"; }
+
+prompt_value() { # $1=var  $2=label  $3=default
+  local _label="${2:-}" _def="${3:-}" ans
+  if [[ -n "$_def" ]]; then
+    read -r -p "$_label [$_def]: " ans || true
+    [[ -z "${ans:-}" ]] && ans="$_def"
+  else
+    read -r -p "$_label: " ans || true
+  fi
+  printf '%s' "${ans:-}"
+}
+
+# visible secrets (per your request)
+prompt_secret_show() { # $1=var  $2=label  $3=default_plain
+  local _label="${2:-}" _def="${3:-}" ans
+  if [[ -n "$_def" ]]; then
+    read -r -p "$_label [$_def]: " ans || true
+    [[ -z "${ans:-}" ]] && ans="$_def"
+  else
+    read -r -p "$_label: " ans || true
+  fi
+  printf '%s' "${ans:-}"
+}
+
+create_site_main() {
+  local site="${1-}"
+  if [[ -z "$site" ]]; then
+    echo "Usage: ./midgard create-site <domain>" >&2
+    return 1
+  fi
+
+  # Resolve absolute project root and paths
+  local script_dir root_dir conf_dir data_dir conf_file
+  script_dir="$(cd -- "$(dirname "${BASH_SOURCE[0]}")" &>/dev/null; pwd -P)"
+  root_dir="$(cd -- "${script_dir}/.." &>/dev/null; pwd -P)"
+  conf_dir="${root_dir}/sites-available"
+  data_dir="${root_dir}/sites-data"
+  conf_file="${conf_dir}/${site}.conf"
+
+  # Encryption key
+  local key key2
+  echo
+  read -r -p "Encryption Key : " key
+  read -r -p "Confirm Key    : " key2
+  if [[ "${key:-}" != "${key2:-}" ]]; then
+    echo "Keys do not match. Aborting." >&2
+    return 1
+  fi
+
+  # Preload existing config (if any)
+  local HAVE_OLD="n"
+  declare -A old
+  if [[ -f "$conf_file" ]]; then
+    HAVE_OLD="y"
+    # shellcheck disable=SC1090
+    source "$conf_file"
+    old[SITE]="${SITE-}"
+    old[REMOTE_USER]="${REMOTE_USER-}"
+    old[REMOTE_HOST]="${REMOTE_HOST-}"
+    old[REMOTE_PATH]="${REMOTE_PATH-}"
+    old[INCLUDE_DIRS]="${INCLUDE_DIRS-}"
+    old[IGNORE_DIRS]="${IGNORE_DIRS-}"
+    old[DB_USER]="${DB_USER-}"
+    old[DB_PASS]="${DB_PASS-}"
+    old[DB_HOST]="${DB_HOST-}"
+    old[DB_NAME]="${DB_NAME-}"
+    old[DB_PREFIX]="${DB_PREFIX-}"
+    old[LOCAL_SYNC_PATH]="${LOCAL_SYNC_PATH-}"
+    old[LOCAL_ARCHIVE_PATH]="${LOCAL_ARCHIVE_PATH-}"
+    old[LOCAL_SQL_PATH]="${LOCAL_SQL_PATH-}"
+    old[LOCAL_SQL_FILE]="${LOCAL_SQL_FILE-}"
+    old[LOCAL_DOCUMENT_ROOT]="${LOCAL_DOCUMENT_ROOT-}"
+    old[LOCAL_ARCHIVE_RETENTION_DAYS]="${LOCAL_ARCHIVE_RETENTION_DAYS-}"
+    old[RESTIC_RETENTION_DAYS]="${RESTIC_RETENTION_DAYS-}"
+    old[LOG_RETENTION_DAYS]="${LOG_RETENTION_DAYS-}"
+    old[AWS_ACCESS_KEY_ID]="${AWS_ACCESS_KEY_ID-}"
+    old[AWS_SECRET_ACCESS_KEY]="${AWS_SECRET_ACCESS_KEY-}"
+    old[AWS_S3_BUCKET]="${AWS_S3_BUCKET-}"
+    old[AWS_REGION]="${AWS_REGION-}"
+    old[AWS_S3_PATH]="${AWS_S3_PATH-}"
+    old[AWS_RESTIC_PASSWORD]="${AWS_RESTIC_PASSWORD-}"
+    old[CLAMAV_ENABLE]="${CLAMAV_ENABLE-}"
+    old[MALDET_ENABLE]="${MALDET_ENABLE-}"
+    old[MALDET_IGNORE_IMAGES]="${MALDET_IGNORE_IMAGES-}"
+    old[WORDFENCE_ENABLE]="${WORDFENCE_ENABLE-}"
+    old[WORDFENCE_VULN_ENABLE]="${WORDFENCE_VULN_ENABLE-}"
+    old[WORDFENCE_ENABLE_DB]="${WORDFENCE_ENABLE_DB-}"
+    old[WORDFENCE_DB_REMOVE_POST]="${WORDFENCE_DB_REMOVE_POST-}"
+    old[UPLOADS_PHP_ENABLE]="${UPLOADS_PHP_ENABLE-}"
+    old[UPLOADS_PHP_CHECKSUMS_UNEXPECTED_FILES]="${UPLOADS_PHP_CHECKSUMS_UNEXPECTED_FILES-}"
+    old[PLUGIN_CHECKSUMS]="${PLUGIN_CHECKSUMS-}"
+    old[THEME_CHECKSUMS]="${THEME_CHECKSUMS-}"
+    old[WORDPRESS_CHECKSUMS]="${WORDPRESS_CHECKSUMS-}"
+    old[WORDPRESS_CHECKSUMS_UNEXPECTED_FILES]="${WORDPRESS_CHECKSUMS_UNEXPECTED_FILES-}"
+    old[WORDPRESS_CHECKSUMS_ALLOWED_MISSING]="${WORDPRESS_CHECKSUMS_ALLOWED_MISSING-}"
+    old[WORDPRESS_CHECKSUMS_IGNORE_PATH]="${WORDPRESS_CHECKSUMS_IGNORE_PATH-}"
+    old[REPORTING_ENABLE]="${REPORTING_ENABLE-}"
+    old[REPORTING_EMAILS]="${REPORTING_EMAILS-}"
+    old[LOCAL_ARCHIVE]="${LOCAL_ARCHIVE-}"
+  fi
+
+  # Decrypt old sensitive fields (if present & key matches)
+  local dec_DB_USER="" dec_DB_PASS="" dec_DB_HOST="" dec_DB_NAME="" dec_DB_PREFIX=""
+  local dec_AWS_ACCESS_KEY_ID="" dec_AWS_SECRET_ACCESS_KEY="" dec_AWS_S3_BUCKET="" dec_AWS_REGION="" dec_AWS_S3_PATH=""
+  local dec_AWS_RESTIC_PASSWORD=""
+  if [[ "$HAVE_OLD" == "y" ]]; then
+    for v in DB_USER DB_PASS DB_HOST DB_NAME DB_PREFIX AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_S3_BUCKET AWS_REGION AWS_S3_PATH AWS_RESTIC_PASSWORD; do
+      val="${old[$v]-}"
+      if [[ -n "${val:-}" ]]; then
+        if out="$(_dec_inline "${key:-}" "$(printf %s "$val" | _trim_quotes)" 2>/dev/null)"; then
+          case "$v" in
+            DB_USER) dec_DB_USER="$out" ;;
+            DB_PASS) dec_DB_PASS="$out" ;;
+            DB_HOST) dec_DB_HOST="$out" ;;
+            DB_NAME) dec_DB_NAME="$out" ;;
+            DB_PREFIX) dec_DB_PREFIX="$out" ;;
+            AWS_ACCESS_KEY_ID) dec_AWS_ACCESS_KEY_ID="$out" ;;
+            AWS_SECRET_ACCESS_KEY) dec_AWS_SECRET_ACCESS_KEY="$out" ;;
+            AWS_S3_BUCKET) dec_AWS_S3_BUCKET="$out" ;;
+            AWS_REGION) dec_AWS_REGION="$out" ;;
+            AWS_S3_PATH) dec_AWS_S3_PATH="$out" ;;
+            AWS_RESTIC_PASSWORD) dec_AWS_RESTIC_PASSWORD="$out" ;;
+          esac
+        fi
+      fi
+    done
+  fi
+
+  # ---- prompts ----
+  local SITE_v REMOTE_USER_v REMOTE_HOST_v REMOTE_PATH_v INCLUDE_DIRS_v IGNORE_DIRS_v
+  local DB_USER_v DB_PASS_v DB_HOST_v DB_NAME_v DB_PREFIX_v
+  local LOCAL_SYNC_PATH_v LOCAL_ARCHIVE_PATH_v LOCAL_SQL_PATH_v LOCAL_SQL_FILE_v LOCAL_DOCUMENT_ROOT_v
+  local LOCAL_ARCHIVE_RETENTION_DAYS_v RESTIC_RETENTION_DAYS_v LOG_RETENTION_DAYS_v
+  local AWS_ACCESS_KEY_ID_v AWS_SECRET_ACCESS_KEY_v AWS_S3_BUCKET_v AWS_REGION_v AWS_S3_PATH_v AWS_RESTIC_PASSWORD_v
+  local CLAMAV_ENABLE_v MALDET_IGNORE_IMAGES_v MALDET_ENABLE_v WORDFENCE_ENABLE_v WORDFENCE_VULN_ENABLE_v WORDFENCE_ENABLE_DB_v
+  local LOCAL_ARCHIVE_v
+  local UPLOADS_PHP_ENABLE_v UPLOADS_PHP_CHECKSUMS_UNEXPECTED_FILES_v PLUGIN_CHECKSUMS_v WORDPRESS_CHECKSUMS_v THEME_CHECKSUMS_v
+  local REPORTING_ENABLE_v REPORTING_EMAILS_v
+
+  SITE_v="$(prompt_value SITE           "Domain name (used for file/dir naming and reports)" "${old[SITE]-$site}")"
+  REMOTE_USER_v="$(prompt_value REMOTE_USER "SSH username on remote host" "${old[REMOTE_USER]-}")"
+  REMOTE_HOST_v="$(prompt_value REMOTE_HOST "SSH hostname (FQDN or IP)"  "${old[REMOTE_HOST]-}")"
+
+  # Suggest remote base as /home/<SITE>/ ; always save with trailing slash
+  local remote_suggest="${old[REMOTE_PATH]-/home/${site}/}"
+  REMOTE_PATH_v="$(prompt_value REMOTE_PATH "Remote base path (absolute, will end with '/')" "${remote_suggest}")"
+  [[ -n "${REMOTE_PATH_v:-}" && "${REMOTE_PATH_v: -1}" != "/" ]] && REMOTE_PATH_v="${REMOTE_PATH_v}/"
+
+  # No defaults (allow blank)
+  INCLUDE_DIRS_v="$(prompt_value INCLUDE_DIRS "Space-separated subdirs of REMOTE_PATH to include (empty = full mirror)" "")"
+  IGNORE_DIRS_v="$(prompt_value IGNORE_DIRS  "Space-separated subdirs to exclude (ignored if INCLUDE_DIRS set)" "")"
+
+  # Visible secrets
+  DB_USER_v="$(prompt_secret_show DB_USER "WordPress DB user" "${dec_DB_USER:-}")"
+  DB_PASS_v="$(prompt_secret_show DB_PASS "WordPress DB password" "${dec_DB_PASS:-}")"
+  DB_HOST_v="$(prompt_secret_show DB_HOST "WordPress DB host" "${dec_DB_HOST:-localhost}")"
+  DB_NAME_v="$(prompt_secret_show DB_NAME "WordPress DB name" "${dec_DB_NAME:-}")"
+  DB_PREFIX_v="$(prompt_secret_show DB_PREFIX "WordPress table prefix" "${dec_DB_PREFIX:-}")"
+
+  # LOCAL_SYNC_PATH suggestion from PRESET_LOCAL_SYNC_PATH + /<site> (no trailing slash)
+  local sync_suggest="${old[LOCAL_SYNC_PATH]-}"
+  if [[ -z "${sync_suggest:-}" && -n "${PRESET_LOCAL_SYNC_PATH:-}" ]]; then
+    sync_suggest="${PRESET_LOCAL_SYNC_PATH%/}/${site}"
+  fi
+  LOCAL_SYNC_PATH_v="$(prompt_value LOCAL_SYNC_PATH "Local mirror path (no trailing slash)" "${sync_suggest}")"
+
+  # LOCAL_ARCHIVE_PATH suggestion from PRESET_LOCAL_ARCHIVE_PATH (ensure base ends with /), then + <site>
+  local arch_suggest="${old[LOCAL_ARCHIVE_PATH]-}"
+  if [[ -z "${arch_suggest:-}" && -n "${PRESET_LOCAL_ARCHIVE_PATH:-}" ]]; then
+    local base="${PRESET_LOCAL_ARCHIVE_PATH%/}/"
+    arch_suggest="${base%/}/${site}"
+  fi
+  LOCAL_ARCHIVE_PATH_v="$(prompt_value LOCAL_ARCHIVE_PATH "Local tar archive root (no trailing slash)" "${arch_suggest}")"
+
+  # Defaults when not present anywhere
+  local sqlpath_suggest="${old[LOCAL_SQL_PATH]-}"
+  [[ -z "${sqlpath_suggest:-}" ]] && sqlpath_suggest="/database"
+  LOCAL_SQL_PATH_v="$(prompt_value LOCAL_SQL_PATH "Relative path under mirror for DB dumps (leading slash added if missing)" "${sqlpath_suggest}")"
+
+  local sqlfile_suggest="${old[LOCAL_SQL_FILE]-}"
+  [[ -z "${sqlfile_suggest:-}" ]] && sqlfile_suggest="${site}.sql"
+  LOCAL_SQL_FILE_v="$(prompt_value LOCAL_SQL_FILE "SQL dump filename" "${sqlfile_suggest}")"
+
+  # Suggest /public_html if not provided previously
+  local docroot_suggest="${old[LOCAL_DOCUMENT_ROOT]-/public_html}"
+  LOCAL_DOCUMENT_ROOT_v="$(prompt_value LOCAL_DOCUMENT_ROOT "Relative site document root (leading slash added if missing)" "${docroot_suggest}")"
+
+  LOCAL_ARCHIVE_RETENTION_DAYS_v="$(prompt_value LOCAL_ARCHIVE_RETENTION_DAYS "Days to keep local tar archives" "${old[LOCAL_ARCHIVE_RETENTION_DAYS]-7}")"
+  RESTIC_RETENTION_DAYS_v="$(prompt_value RESTIC_RETENTION_DAYS "Days to keep restic snapshots" "${old[RESTIC_RETENTION_DAYS]-30}")"
+  LOG_RETENTION_DAYS_v="$(prompt_value LOG_RETENTION_DAYS "Days to keep per-site logs" "${old[LOG_RETENTION_DAYS]-30}")"
+
+  AWS_ACCESS_KEY_ID_v="$(prompt_secret_show AWS_ACCESS_KEY_ID "AWS Access Key ID" "${dec_AWS_ACCESS_KEY_ID:-}")"
+  AWS_SECRET_ACCESS_KEY_v="$(prompt_secret_show AWS_SECRET_ACCESS_KEY "AWS Secret Access Key" "${dec_AWS_SECRET_ACCESS_KEY:-}")"
+  AWS_S3_BUCKET_v="$(prompt_secret_show AWS_S3_BUCKET "AWS S3 bucket" "${dec_AWS_S3_BUCKET:-}")"
+  AWS_REGION_v="$(prompt_secret_show AWS_REGION "AWS region" "${dec_AWS_REGION:-}")"
+  AWS_S3_PATH_v="$(prompt_secret_show AWS_S3_PATH "S3 prefix/path for this site" "${dec_AWS_S3_PATH:-}")"
+
+  # Suggest a 64-char [A-Za-z0-9] if no previous value decrypted
+  local restic_suggest="${dec_AWS_RESTIC_PASSWORD:-}"
+  [[ -z "${restic_suggest:-}" ]] && restic_suggest="$(_rand64)"
+  AWS_RESTIC_PASSWORD_v="$(prompt_secret_show AWS_RESTIC_PASSWORD "Restic repository password" "${restic_suggest}")"
+
+  CLAMAV_ENABLE_v="$(prompt_value CLAMAV_ENABLE "Enable ClamAV (y/n)" "${old[CLAMAV_ENABLE]-y}")"
+  MALDET_ENABLE_v="$(prompt_value MALDET_ENABLE "Enable Maldet (y/n)" "${old[MALDET_ENABLE]-y}")"
+  MALDET_IGNORE_IMAGES_v="$(prompt_value MALDET_IGNORE_IMAGES "Maldet Ignore Images (y/n)" "${old[MALDET_IGNORE_IMAGES]-n}")"
+
+  WORDFENCE_ENABLE_v="$(prompt_value WORDFENCE_ENABLE "Enable Wordfence file scan (y/n)" "${old[WORDFENCE_ENABLE]-y}")"
+
+  WORDFENCE_VULN_ENABLE_v="$(prompt_value WORDFENCE_VULN_ENABLE "Enable Wordfence vuln scan (y/n)" "${old[WORDFENCE_VULN_ENABLE]-y}")"
+  WORDFENCE_ENABLE_DB_v="$(prompt_value WORDFENCE_ENABLE_DB "Enable Wordfence DB scan (y/n)" "${old[WORDFENCE_ENABLE_DB]-y}")"
+  UPLOADS_PHP_ENABLE_v="$(prompt_value UPLOADS_PHP_ENABLE "Enable Uploads scan for PHP (y/n)" "${old[UPLOADS_PHP_ENABLE]-y}")"
+  PLUGIN_CHECKSUMS_v="$(prompt_value PLUGIN_CHECKSUMS "scan plugin checksums (y/n)" "${old[PLUGIN_CHECKSUMS]-y}")"
+  THEME_CHECKSUMS_v="$(prompt_value THEME_CHECKSUMS "scan theme checksums (y/n)" "${old[THEME_CHECKSUMS]-y}")"
+  WORDPRESS_CHECKSUMS_v="$(prompt_value WORDPRESS_CHECKSUMS "scan wordpress checksums (y/n)" "${old[WORDPRESS_CHECKSUMS]-y}")"
+
+  LOCAL_ARCHIVE_v="$(prompt_value LOCAL_ARCHIVE "create a local archive (y/n)" "${old[LOCAL_ARCHIVE]-y}")"
+
+  REPORTING_ENABLE_v="$(prompt_value REPORTING_ENABLE "Enable per-site reporting (y/n)" "${old[REPORTING_ENABLE]-y}")"
+  REPORTING_EMAILS_v="$(prompt_value REPORTING_EMAILS "Comma/space-separated report recipients" "${old[REPORTING_EMAILS]-midgard@example.com}")"
+
+  # Normalize relative paths that should start with '/'
+  [[ -n "${LOCAL_SQL_PATH_v:-}" && "${LOCAL_SQL_PATH_v:0:1}" != "/" ]] && LOCAL_SQL_PATH_v="/${LOCAL_SQL_PATH_v}"
+  [[ -n "${LOCAL_DOCUMENT_ROOT_v:-}" && "${LOCAL_DOCUMENT_ROOT_v:0:1}" != "/" ]] && LOCAL_DOCUMENT_ROOT_v="/${LOCAL_DOCUMENT_ROOT_v}"
+
+  # ---- re-encrypt sensitive values ----
+  enc_DB_USER="$(_enc_inline "${key:-}" <<<"${DB_USER_v:-}")"
+  enc_DB_PASS="$(_enc_inline "${key:-}" <<<"${DB_PASS_v:-}")"
+  enc_DB_HOST="$(_enc_inline "${key:-}" <<<"${DB_HOST_v:-}")"
+  enc_DB_NAME="$(_enc_inline "${key:-}" <<<"${DB_NAME_v:-}")"
+  enc_DB_PREFIX="$(_enc_inline "${key:-}" <<<"${DB_PREFIX_v:-}")"
+
+  enc_AWS_ACCESS_KEY_ID="$(_enc_inline "${key:-}" <<<"${AWS_ACCESS_KEY_ID_v:-}")"
+  enc_AWS_SECRET_ACCESS_KEY="$(_enc_inline "${key:-}" <<<"${AWS_SECRET_ACCESS_KEY_v:-}")"
+  enc_AWS_S3_BUCKET="$(_enc_inline "${key:-}" <<<"${AWS_S3_BUCKET_v:-}")"
+  enc_AWS_REGION="$(_enc_inline "${key:-}" <<<"${AWS_REGION_v:-}")"
+  enc_AWS_S3_PATH="$(_enc_inline "${key:-}" <<<"${AWS_S3_PATH_v:-}")"
+  enc_AWS_RESTIC_PASSWORD="$(_enc_inline "${key:-}" <<<"${AWS_RESTIC_PASSWORD_v:-}")"
+
+  # ---- announce & write conf ----
+  status_start "Creating/updating $(realpath -m "$conf_file") ..."
+  echo
+
+  mkdir -p "$conf_dir" "$data_dir/$site" || true
+
+  {
+    cat <<'HDR'
+# ===========================================
+# Per-site configuration (encrypted secrets)
+# ===========================================
+HDR
+    echo "# Version : $(date)"
+    echo "SITE=$(_escape_val "${SITE_v:-}")"
+    echo
+    echo "# SSH connection"
+    echo "REMOTE_USER=$(_escape_val "${REMOTE_USER_v:-}")"
+    echo "REMOTE_HOST=$(_escape_val "${REMOTE_HOST_v:-}")"
+    echo
+    echo "# Remote paths"
+    echo "REMOTE_PATH=$(_escape_val "${REMOTE_PATH_v:-}")"
+    echo
+    echo "# Include/Ignore directories (relative to REMOTE_PATH)"
+    echo "INCLUDE_DIRS=$(_escape_val "${INCLUDE_DIRS_v:-}")"
+    echo "IGNORE_DIRS=$(_escape_val "${IGNORE_DIRS_v:-}")"
+    echo
+    echo "# Database credentials (encrypted)"
+    echo "DB_USER=$(_escape_val "${enc_DB_USER:-}")"
+    echo "DB_PASS=$(_escape_val "${enc_DB_PASS:-}")"
+    echo "DB_HOST=$(_escape_val "${enc_DB_HOST:-}")"
+    echo "DB_NAME=$(_escape_val "${enc_DB_NAME:-}")"
+    echo "DB_PREFIX=$(_escape_val "${enc_DB_PREFIX:-}")"
+    echo
+    echo "# Local backup directories"
+    echo "LOCAL_SYNC_PATH=$(_escape_val "${LOCAL_SYNC_PATH_v:-}")"
+    echo "LOCAL_ARCHIVE_PATH=$(_escape_val "${LOCAL_ARCHIVE_PATH_v:-}")"
+    echo "LOCAL_SQL_PATH=$(_escape_val "${LOCAL_SQL_PATH_v:-}")"
+    echo "LOCAL_SQL_FILE=$(_escape_val "${LOCAL_SQL_FILE_v:-}")"
+    echo "LOCAL_DOCUMENT_ROOT=$(_escape_val "${LOCAL_DOCUMENT_ROOT_v:-}")"
+    echo
+    echo "# Retention policy"
+    echo "LOCAL_ARCHIVE_RETENTION_DAYS=$(_escape_val "${LOCAL_ARCHIVE_RETENTION_DAYS_v:-}")"
+    echo "RESTIC_RETENTION_DAYS=$(_escape_val "${RESTIC_RETENTION_DAYS_v:-}")"
+    echo "LOG_RETENTION_DAYS=$(_escape_val "${LOG_RETENTION_DAYS_v:-}")"
+    echo
+    echo "# AWS S3 / RESTIC settings (encrypted)"
+    echo "AWS_ACCESS_KEY_ID=$(_escape_val "${enc_AWS_ACCESS_KEY_ID:-}")"
+    echo "AWS_SECRET_ACCESS_KEY=$(_escape_val "${enc_AWS_SECRET_ACCESS_KEY:-}")"
+    echo "AWS_S3_BUCKET=$(_escape_val "${enc_AWS_S3_BUCKET:-}")"
+    echo "AWS_REGION=$(_escape_val "${enc_AWS_REGION:-}")"
+    echo "AWS_S3_PATH=$(_escape_val "${enc_AWS_S3_PATH:-}")"
+    echo "AWS_RESTIC_PASSWORD=$(_escape_val "${enc_AWS_RESTIC_PASSWORD:-}")"
+    echo
+    echo "# Virus / Malware Detection"
+    echo "CLAMAV_ENABLE=$(_escape_val "${CLAMAV_ENABLE_v:-}")"
+    echo "MALDET_ENABLE=$(_escape_val "${MALDET_ENABLE_v:-}")"
+    echo "MALDET_IGNORE_IMAGES=$(_escape_val "${MALDET_IGNORE_IMAGES_v:-}")"
+    echo "WORDFENCE_ENABLE=$(_escape_val "${WORDFENCE_ENABLE_v:-}")"
+    echo "WORDFENCE_VULN_ENABLE=$(_escape_val "${WORDFENCE_VULN_ENABLE_v:-}")"
+    echo "WORDFENCE_ENABLE_DB=$(_escape_val "${WORDFENCE_ENABLE_DB_v:-}")"
+    echo "WORDFENCE_DB_REMOVE_POST=$(_escape_val "${WORDFENCE_DB_REMOVE_POST:-}")"
+    echo "UPLOADS_PHP_ENABLE=$(_escape_val "${UPLOADS_PHP_ENABLE_v:-}")"
+    echo "LOCAL_ARCHIVE=$(_escape_val "${LOCAL_ARCHIVE_v:-}")"
+
+    echo "UPLOADS_PHP_CHECKSUMS_UNEXPECTED_FILES=$(_escape_val "${UPLOADS_PHP_CHECKSUMS_UNEXPECTED_FILES_v:-}")"
+
+    echo "PLUGIN_CHECKSUMS=$(_escape_val "${PLUGIN_CHECKSUMS_v:-}")"
+    echo "THEME_CHECKSUMS=$(_escape_val "${THEME_CHECKSUMS_v:-}")"
+    echo "WORDPRESS_CHECKSUMS=$(_escape_val "${WORDPRESS_CHECKSUMS_v:-}")"
+    echo
+    echo "WORDPRESS_CHECKSUMS_UNEXPECTED_FILES=$(_escape_val "${WORDPRESS_CHECKSUMS_UNEXPECTED_FILES:-}")"
+    echo
+    echo "WORDPRESS_CHECKSUMS_ALLOWED_MISSING=$(_escape_val "${WORDPRESS_CHECKSUMS_ALLOWED_MISSING:-}")"
+    echo
+    echo "WORDPRESS_CHECKSUMS_IGNORE_PATH=$(_escape_val "${WORDPRESS_CHECKSUMS_IGNORE_PATH:-}")"
+    echo
+    echo "# Reporting"
+    echo "REPORTING_ENABLE=$(_escape_val "${REPORTING_ENABLE_v:-}")"
+    echo "REPORTING_EMAILS=$(_escape_val "${REPORTING_EMAILS_v:-}")"
+  } > "$conf_file"
+
+  chmod 640 "$conf_file"
+  status_ok
+  echo "  Wrote $(realpath -m "$conf_file")"
+
+  # ---- materialize plaintext runtime files in sites-data/<site>/ ----
+  # restic password
+  echo -n "${AWS_RESTIC_PASSWORD_v:-}" > "${data_dir}/${site}/restic.pass"
+  chmod 600 "${data_dir}/${site}/restic.pass"
+
+  # aws credentials for restic usage
+  {
+    echo "AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID_v:-}"
+    echo "AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY_v:-}"
+    echo "AWS_S3_BUCKET=${AWS_S3_BUCKET_v:-}"
+    echo "AWS_S3_PATH=${AWS_S3_PATH_v:-}"
+    echo "AWS_DEFAULT_REGION=${AWS_REGION_v:-}"
+  } > "${data_dir}/${site}/aws-credentials"
+  chmod 640 "${data_dir}/${site}/aws-credentials"
+
+  # mysql credentials (plaintext)
+  {
+    echo '## Database credentials (unencrypted)'
+    echo "DB_USER=\"${DB_USER_v:-}\""
+    echo "DB_PASS=\"${DB_PASS_v:-}\""
+    echo "DB_HOST=\"${DB_HOST_v:-}\""
+    echo "DB_NAME=\"${DB_NAME_v:-}\""
+    echo "DB_PREFIX=\"${DB_PREFIX_v:-}\""
+  } > "${data_dir}/${site}/mysql-credentials"
+  chmod 640 "${data_dir}/${site}/mysql-credentials"
+
+  echo "  Wrote $(realpath -m "${data_dir}/${site}/restic.pass")"
+  echo "  Wrote $(realpath -m "${data_dir}/${site}/aws-credentials")"
+  echo "  Wrote $(realpath -m "${data_dir}/${site}/mysql-credentials")"
+
+  # ---- SSH keypair (RSA) if missing ----
+  if [[ ! -f "${data_dir}/${site}/id_rsa" || ! -f "${data_dir}/${site}/id_rsa.pub" ]]; then
+    echo "  Generating SSH keypair (RSA 4096) for ${site} …"
+    ssh-keygen -t rsa -b 4096 -N "" -f "${data_dir}/${site}/id_rsa" >/dev/null
+    chmod 600 "${data_dir}/${site}/id_rsa"
+    chmod 644 "${data_dir}/${site}/id_rsa.pub"
+    echo "  Key created:"
+    echo "    Private: $(realpath -m "${data_dir}/${site}/id_rsa")"
+    echo "    Public : $(realpath -m "${data_dir}/${site}/id_rsa.pub")"
+    echo "  Install the public key on the remote host (e.g., ${REMOTE_USER_v:-}@${REMOTE_HOST_v:-}):"
+    echo "    ssh-copy-id -i \"${data_dir}/${site}/id_rsa.pub\" \"${REMOTE_USER_v:-}@${REMOTE_HOST_v:-}\""
+  fi
+
+  [[ -d "$data_dir/$site" ]] && echo "  Ensured data dir: $(realpath -m "$data_dir/$site")"
+}
+
+create_site_main "$@"

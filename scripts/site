@@ -1,0 +1,281 @@
+#!/usr/bin/env bash
+# file : ./scripts/site
+#------------------------------------------------------------------------------
+#
+#         .__    .___                      .___
+#   _____ |__| __| _/ _________ _______  __| _/
+#  /     \|  |/ __ | / ___\__  \\_  __ \/ __ |
+# |  Y Y  \  / /_/ |/ /_/  > __ \|  | \/ /_/ |
+# |__|_|  /__\____ |\___  (____  /__|  \____ |
+#       \/        \/_____/     \/           \/
+#
+# site — list/enable/disable per-site configs (with "all" support)
+#   - must be sourced by ./midgard (MIDGARD_MAIN=1)
+#   - expects helper loaded (status_start/status_ok/status_fail/info)
+#   - verbose by design
+#------------------------------------------------------------------------------
+
+[[ "${MIDGARD_MAIN:-}" == "1" ]] || {
+  echo "This script must be sourced from the midgard launcher." >&2
+  return 1 2>/dev/null || exit 1
+}
+
+# Return: echo "<root_dir> <conf_dir> <enabled_dir>"
+_site_paths() {
+  local script_dir root_dir conf_dir enabled_dir
+  script_dir="$(cd -- "$(dirname "${BASH_SOURCE[0]}")" &>/dev/null; pwd -P)"
+  root_dir="$(cd -- "${script_dir}/.." &>/dev/null; pwd -P)"
+  conf_dir="${root_dir}/sites-available"
+  enabled_dir="${root_dir}/sites-enabled"
+  echo "$root_dir" "$conf_dir" "$enabled_dir"
+}
+
+_is_example() { [[ "$1" == "example.com" || "$1" == "example.com.conf" ]]; }
+_valid_site_name() { [[ "$1" =~ ^[A-Za-z0-9._-]+$ ]]; }
+
+# Enumerate available sites (strip .conf), excluding example.com.conf
+_list_sites_available() {
+  local _root _conf _enabled
+  read -r _root _conf _enabled < <(_site_paths)
+  shopt -s nullglob
+  for f in "${_conf}"/*.conf; do
+    local base="$(basename "$f")"
+    [[ "$base" == "example.com.conf" ]] && continue
+    echo "${base%.conf}"
+  done
+  shopt -u nullglob
+}
+
+# Enumerate enabled sites (symlink names), excluding example.com.conf
+_list_sites_enabled() {
+  local _root _conf _enabled
+  read -r _root _conf _enabled < <(_site_paths)
+  shopt -s nullglob
+  for f in "${_enabled}"/*.conf; do
+    local base="$(basename "$f")"
+    [[ -L "$f" ]] || continue
+    [[ "$base" == "example.com.conf" ]] && continue
+    echo "${base%.conf}"
+  done
+  shopt -u nullglob
+}
+
+# Pretty list of sites and status
+site_list() {
+  local root_dir conf_dir enabled_dir
+  read -r root_dir conf_dir enabled_dir < <(_site_paths)
+
+  status_start "Listing sites"
+  echo
+
+  local found=0
+  shopt -s nullglob
+  for f in "${conf_dir}"/*.conf; do
+    local base site enabled
+    base="$(basename "$f")"
+    [[ "$base" == "example.com.conf" ]] && continue
+    site="${base%.conf}"
+    if [[ -L "${enabled_dir}/${base}" ]]; then
+      enabled="[ENABLED]"
+    else
+      enabled="[DISABLED]"
+    fi
+    printf "  %-40s %s\n" "${site}" "${enabled}"
+    found=1
+  done
+  shopt -u nullglob
+
+  echo
+  if [[ $found -eq 0 ]]; then
+    echo "  (no .conf found in ${conf_dir})"
+  fi
+  status_ok
+}
+
+# -- Internal single-site operations --
+
+_enable_one() {
+  local site="$1"
+  local root_dir conf_dir enabled_dir
+  read -r root_dir conf_dir enabled_dir < <(_site_paths)
+
+  local src="${conf_dir}/${site}.conf"
+  local dst="${enabled_dir}/${site}.conf"
+
+  status_start "Enabling ${site} ..."
+  echo
+
+  if [[ ! -f "$src" ]]; then
+    status_fail; echo "    - config not found: $src"
+    return 1
+  fi
+
+  mkdir -p "$enabled_dir" || true
+
+  if [[ -L "$dst" ]]; then
+    status_ok; echo "  Already enabled: $(realpath -m "$dst")"
+    return 0
+  elif [[ -e "$dst" ]]; then
+    status_fail; echo "    - target exists and is not a symlink: $dst"
+    return 1
+  fi
+
+  if ( cd "$enabled_dir" && ln -s "../sites-available/${site}.conf" "${site}.conf" ); then
+    status_ok
+    echo "  Linked symlink: ${dst}"
+    echo "  → Target:       $(realpath -m "$dst")"
+    return 0
+  else
+    status_fail; echo "    - failed to create symlink"
+    return 1
+  fi
+}
+
+_disable_one() {
+  local site="$1"
+  local root_dir conf_dir enabled_dir
+  read -r root_dir conf_dir enabled_dir < <(_site_paths)
+
+  local dst="${enabled_dir}/${site}.conf"
+
+  status_start "Disabling ${site} ..."
+  echo
+
+  if [[ -L "$dst" ]]; then
+    if rm -f "$dst"; then
+      status_ok; echo "  Removed: $(realpath -m "$dst" 2>/dev/null || echo "$dst")"
+      return 0
+    else
+      status_fail; echo "    - failed to remove symlink: $dst"
+      return 1
+    fi
+  elif [[ -e "$dst" ]]; then
+    status_fail; echo "    - not a symlink; refusing to delete: $dst"
+    return 1
+  else
+    status_ok; echo "  Already disabled (no symlink): $dst"
+    return 0
+  fi
+}
+
+# -- Public API --
+
+site_enable() {
+  local site="$1"
+  [[ -n "$site" ]] || { echo "Usage: site_enable <site|all>"; return 1; }
+
+  if [[ "$site" == "all" ]]; then
+    status_start "Enabling ALL sites from sites-available/"
+    echo
+
+    # snapshot the list first (no live stdin to the loop)
+    local -a sites=()
+    mapfile -t sites < <(_list_sites_available)
+
+    local ok=0 fail=0 any=0
+
+    # temporarily disable errexit if set, then restore
+    local _errexit_set=0
+    case $- in *e*) _errexit_set=1; set +e;; esac
+
+    for s in "${sites[@]}"; do
+      any=1
+      _is_example "$s" && { echo "Skipping example.com"; echo; continue; }
+      _valid_site_name "$s" || { echo "Invalid site name: '$s'"; ((fail++)); echo; continue; }
+      if _enable_one "$s"; then
+        ((ok++))
+      else
+        ((fail++))
+      fi
+      echo
+    done
+
+    (( _errexit_set )) && set -e
+
+    if (( any == 0 )); then
+      status_ok; echo "  No sites to enable."
+      return 0
+    fi
+    if (( fail == 0 )); then
+      status_ok; echo "  Done. Enabled: ${ok}, Failed: 0"
+      return 0
+    else
+      status_fail; echo "  Completed with errors. Enabled: ${ok}, Failed: ${fail}"
+      return 1
+    fi
+  fi
+
+  _is_example "$site" && { echo "Refusing to operate on example.com"; return 1; }
+  _valid_site_name "$site" || { echo "Invalid site name: '$site'"; return 1; }
+  _enable_one "$site"
+}
+
+site_disable() {
+  local site="$1"
+  [[ -n "$site" ]] || { echo "Usage: site_disable <site|all>"; return 1; }
+
+  if [[ "$site" == "all" ]]; then
+    status_start "Disabling ALL enabled sites (symlinks only)"
+    echo
+
+    local -a sites=()
+    mapfile -t sites < <(_list_sites_enabled)
+
+    local ok=0 fail=0 any=0
+
+    local _errexit_set=0
+    case $- in *e*) _errexit_set=1; set +e;; esac
+
+    for s in "${sites[@]}"; do
+      any=1
+      _is_example "$s" && { echo "Skipping example.com"; echo; continue; }
+      _valid_site_name "$s" || { echo "Invalid site name: '$s'"; ((fail++)); echo; continue; }
+      if _disable_one "$s"; then
+        ((ok++))
+      else
+        ((fail++))
+      fi
+      echo
+    done
+
+    (( _errexit_set )) && set -e
+
+    if (( any == 0 )); then
+      status_ok; echo "  No enabled sites to disable."
+      return 0
+    fi
+    if (( fail == 0 )); then
+      status_ok; echo "  Done. Disabled: ${ok}, Failed: 0"
+      return 0
+    else
+      status_fail; echo "  Completed with errors. Disabled: ${ok}, Failed: ${fail}"
+      return 1
+    fi
+  fi
+
+  _is_example "$site" && { echo "Refusing to operate on example.com"; return 1; }
+  _valid_site_name "$site" || { echo "Invalid site name: '$site'"; return 1; }
+  _disable_one "$site"
+}
+
+# Optional dispatcher if midgard forwards like: ./midgard site <subcmd> ...
+site_cmd() {
+  local action="$1"; shift || true
+  case "$action" in
+    list)    site_list "$@";;
+    enable)  site_enable "$@";;
+    disable) site_disable "$@";;
+    ""|help|-h|--help)
+      echo "Usage:"
+      echo "  site list"
+      echo "  site enable <site|all>"
+      echo "  site disable <site|all>"
+      return 1
+      ;;
+    *)
+      echo "Unknown subcommand: $action"
+      echo "Try: site list|enable|disable"
+      return 1
+      ;;
+  esac
+}

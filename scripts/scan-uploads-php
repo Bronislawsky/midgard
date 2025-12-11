@@ -1,0 +1,229 @@
+#!/usr/bin/env bash
+# file : ./scripts/scan-uploads-php
+#------------------------------------------------------------------------------
+#
+#         .__    .___                      .___
+#   _____ |__| __| _/ _________ _______  __| _/
+#  /     \|  |/ __ | / ___\__  \\_  __ \/ __ |
+# |  Y Y  \  / /_/ |/ /_/  > __ \|  | \/ /_/ |
+# |__|_|  /__\____ |\___  (____  /__|  \____ |
+#       \/        \/_____/     \/           \/
+#
+# Scan uploads/ for PHP-like files, double-extensions, and executables.
+# Must be sourced by ./midgard (MIDGARD_MAIN=1).
+# Logs:    ${MIDGARD_SESSION_LOG_DIR}/${site}.log
+# Reports: ${MIDGARD_SESSION_REPORT_DIR}/${site}.report  (UPLOADS_PHP=OK|FAIL|SKIPPED)
+#------------------------------------------------------------------------------
+
+# Safety guard
+if [[ "${MIDGARD_MAIN:-}" != "1" ]]; then
+  echo "This script must be sourced from the midgard launcher." >&2
+  return 1 2>/dev/null || exit 1
+fi
+
+scan_uploads_php_main() {
+  local site="${1:-}"
+  if [[ -z "$site" ]]; then
+    echo "scan_uploads_php_main: missing site" >&2
+    return 1
+  fi
+
+  # CONFIG_SITES maps site -> name of its assoc array (string)
+  local assoc_name="${CONFIG_SITES[$site]:-}"
+  if [[ -z "$assoc_name" ]]; then
+    echo "scan_uploads_php_main: site not loaded: $site" >&2
+    return 1
+  fi
+
+  # Prepare per-run paths
+  mkdir -p "${MIDGARD_SESSION_LOG_DIR}" "${MIDGARD_SESSION_REPORT_DIR}"
+  local SITE_LOG_FILE="${MIDGARD_SESSION_LOG_DIR}/${site}.log"
+  local SITE_REPORT_FILE="${MIDGARD_SESSION_REPORT_DIR}/${site}.report"
+
+  # Resolve per-site toggles: prefer new flag, fallback to legacy
+  local UPLOADS_PHP_ENABLE
+  UPLOADS_PHP_ENABLE="$( midgard_get_value_from_array "$assoc_name" UPLOADS_PHP_ENABLE )"
+
+  # Console header (same layout as other checks)
+  echo
+  echo -en "$(midgard_current_time) ${site} "
+  echo -en "Scan uploads for PHP & executables... "
+  if [[ "$UPLOADS_PHP_ENABLE" != "y" ]]; then
+    echo -e "${c_light_blue}[${c_light_red}DISABLED${c_light_blue}]${c_reset}"
+    echo "$(midgard_current_time) Scan uploads for PHP & executables... [DISABLED]" >> "${SITE_LOG_FILE}"
+    echo "UPLOADS_PHP=SKIPPED" >> "${SITE_REPORT_FILE}"
+    return 0
+  fi
+  echo -e "${c_light_blue}[${c_green}ENABLED${c_light_blue}]${c_reset}"
+
+  echo "$(midgard_current_time) Scan uploads for PHP & executables... [ENABLED]" >> "${SITE_LOG_FILE}"
+
+  # Resolve site paths
+  local LOCAL_SYNC_PATH LOCAL_DOCUMENT_ROOT WP_CONTENT_DIR
+  LOCAL_SYNC_PATH="$(        midgard_get_value_from_array "$assoc_name" LOCAL_SYNC_PATH       )"
+  LOCAL_DOCUMENT_ROOT="$(    midgard_get_value_from_array "$assoc_name" LOCAL_DOCUMENT_ROOT   )"
+  WP_CONTENT_DIR="$(         midgard_get_value_from_array "$assoc_name" WP_CONTENT_DIR        )"
+
+  if [ -z "${LOCAL_SYNC_PATH:-}" ]; then
+    echo -e "$(midgard_current_time) ${site}    ${c_yellow}LOCAL_SYNC_PATH${c_reset} ${c_light_red}is not set${c_reset}"
+    echo "$(midgard_current_time)   LOCAL_SYNC_PATH is not set" >> "${SITE_LOG_FILE}"
+    echo -e "$(midgard_current_time) ${site} Scan uploads for PHP & executables... ${c_light_blue}[${c_light_red}FAIL${c_light_blue}]${c_reset}"
+    echo "$(midgard_current_time) Scan uploads for PHP & executables... [FAIL]" >> "${SITE_LOG_FILE}"
+    echo "UPLOADS_PHP=FAIL" >> "${SITE_REPORT_FILE}"
+    return 1
+  fi
+
+  if [ -z "${LOCAL_DOCUMENT_ROOT:-}" ]; then
+    echo -e "$(midgard_current_time) ${site}    ${c_yellow}LOCAL_DOCUMENT_ROOT${c_reset} ${c_light_red}is not set${c_reset}"
+    echo "$(midgard_current_time)   LOCAL_DOCUMENT_ROOT is not set" >> "${SITE_LOG_FILE}"
+    echo -e "$(midgard_current_time) ${site} Scan uploads for PHP & executables... ${c_light_blue}[${c_light_red}FAIL${c_light_blue}]${c_reset}"
+    echo "$(midgard_current_time) Scan uploads for PHP & executables... [FAIL]" >> "${SITE_LOG_FILE}"
+    echo "UPLOADS_PHP=FAIL" >> "${SITE_REPORT_FILE}"
+    return 1
+  fi
+
+
+  # TODO FIX OUTPUT BELOW
+  [[ "${LOCAL_DOCUMENT_ROOT}" != /* ]] && LOCAL_DOCUMENT_ROOT="/${LOCAL_DOCUMENT_ROOT}"
+  local SITE_WEB_ROOT_PATH="${LOCAL_SYNC_PATH%/}${LOCAL_DOCUMENT_ROOT}"
+  if [[ ! -d "${SITE_WEB_ROOT_PATH}" ]]; then
+    status_start "    uploads-php ${site} (missing ${SITE_WEB_ROOT_PATH}) ..."
+    status_fail
+    {
+      echo "== $(midgard_current_time) :: UPLOADS PHP SCAN FAIL (DOCROOT MISSING) :: ${site} =="
+      echo "DOCROOT : ${SITE_WEB_ROOT_PATH}"
+    } >> "${SITE_LOG_FILE}"
+    echo "UPLOADS_PHP=FAIL" >> "${SITE_REPORT_FILE}"
+    return 1
+  fi
+
+  local wpc="${WP_CONTENT_DIR:-wp-content}"; wpc="${wpc#/}"
+  local SITE_UPLOADS_PATH="${SITE_WEB_ROOT_PATH%/}/${wpc}/uploads"
+
+  if [[ ! -d "${SITE_UPLOADS_PATH}" ]]; then
+    echo -e "    ${c_light_blue}SKIPPED (no uploads dir)${c_reset}"
+    {
+      echo "== $(midgard_current_time) :: UPLOADS PHP SCAN SKIPPED (NO UPLOADS) :: ${site} =="
+      echo "DOCROOT : ${SITE_WEB_ROOT_PATH}"
+      echo "UPLOADS : ${SITE_UPLOADS_PATH} (not found)"
+    } >> "${SITE_LOG_FILE}"
+    echo "UPLOADS_PHP=SKIPPED" >> "${SITE_REPORT_FILE}"
+    return 0
+  fi
+
+  # ---------------------------------------------------------------------------
+  # Allowlist: unexpected PHP files with required SHA256 (relative paths)
+  # Example var content:
+  # UPLOADS_PHP_CHECKSUMS_UNEXPECTED_FILES="
+  # wp-content/uploads/wpforms/cache/index.php:76e7cd...06c6f
+  # "
+  # ---------------------------------------------------------------------------
+  local UPLOADS_PHP_CHECKSUMS_UNEXPECTED_FILES
+  UPLOADS_PHP_CHECKSUMS_UNEXPECTED_FILES="$( midgard_get_value_from_array "$assoc_name" UPLOADS_PHP_CHECKSUMS_UNEXPECTED_FILES )"
+
+  # Build allowlist map: key = relative path from site web root, val = sha256
+  declare -A __ALLOW_PHP_SHA256=()
+  if [[ -n "${UPLOADS_PHP_CHECKSUMS_UNEXPECTED_FILES// }" ]]; then
+    while IFS= read -r __line; do
+      __line="${__line%%#*}"; __line="${__line%"${__line##*[![:space:]]}"}"
+      [[ -z "$__line" ]] && continue
+      # split on first colon
+      local __p="${__line%%:*}"
+      local __h="${__line#*:}"
+      __p="${__p#"${__p%%[![:space:]]*}"}"; __p="${__p%"${__p##*[![:space:]]}"}"
+      __h="${__h#"${__h%%[![:space:]]*}"}"; __h="${__h%"${__h##*[![:space:]]}"}"
+      [[ -n "$__p" && -n "$__h" ]] && __ALLOW_PHP_SHA256["$__p"]="$__h"
+    done <<< "$UPLOADS_PHP_CHECKSUMS_UNEXPECTED_FILES"
+  fi
+
+  # Helper: compute sha256 (prefer sha256sum, fallback to openssl)
+  _sha256_of() {
+    local f="$1"
+    if command -v sha256sum >/dev/null 2>&1; then
+      sha256sum "$f" 2>/dev/null | awk '{print $1}'
+    elif command -v openssl >/dev/null 2>&1; then
+      openssl dgst -sha256 "$f" 2>/dev/null | awk '{print $NF}'
+    else
+      echo ""
+      return 1
+    fi
+  }
+
+  # Temporary files for findings
+  local tmp_php
+  tmp_php="$(mktemp -t uploads.php.${site}.XXXXXX)"
+
+  local rc=0
+  local rc_php=0
+  local violations=0
+
+  # 1) PHP-like extensions (follow symlinks)
+  if ! find -L "${SITE_UPLOADS_PATH}" -type f \( \
+        -iname '*.php'  -o -iname '*.phtml' -o \
+        -iname '*.php5' -o -iname '*.php7'  -o -iname '*.php8' \
+      \) -print > "${tmp_php}" 2>&1; then
+    rc_php=$?
+  fi
+  echo -e "$(midgard_current_time) ${site}  PHP-like extensions..."
+  echo "$(midgard_current_time)   PHP-like extensions..." >> "${SITE_LOG_FILE}"
+
+  while IFS= read -r line; do
+    [[ -z "$line" ]] && continue
+
+    # Compute relative path from site web root for allowlist matching
+    local rel
+    if rel="$(realpath --relative-to "$SITE_WEB_ROOT_PATH" "$line" 2>/dev/null)"; then
+      :
+    else
+      rel="${line#${SITE_WEB_ROOT_PATH%/}/}"
+    fi
+
+    if [[ -n "${__ALLOW_PHP_SHA256[$rel]:-}" ]]; then
+      # Allowlisted: verify checksum
+      local want_sha="${__ALLOW_PHP_SHA256[$rel]}"
+      local got_sha="$(_sha256_of "$line")"
+      if [[ -n "$got_sha" && "$got_sha" == "$want_sha" ]]; then
+        # VERIFIED => no violation
+        echo -e "$(midgard_current_time) ${site}    ${c_light_blue}VERIFIED${c_reset} : ${c_light_blue}${rel}${c_reset}"
+        echo    "$(midgard_current_time)     VERIFIED : ${rel}" >> "${SITE_LOG_FILE}"
+      else
+        # Allowlisted but checksum mismatch => VIOLATION
+        echo -e "$(midgard_current_time) ${site}    ${c_light_red}FOUND (checksum mismatch)${c_reset} : ${c_light_blue}${line}${c_reset}"
+        echo    "$(midgard_current_time)     FOUND (checksum mismatch) : ${line}" >> "${SITE_LOG_FILE}"
+        violations=$((violations+1))
+      fi
+    else
+      # Not allowlisted => VIOLATION
+      echo -e "$(midgard_current_time) ${site}    ${c_light_red}FOUND${c_reset} : ${c_light_blue}$line${c_reset}"
+      echo    "$(midgard_current_time)     FOUND : $line" >> "${SITE_LOG_FILE}"
+      violations=$((violations+1))
+    fi
+  done < "${tmp_php}"
+
+  # Any violations?
+  if (( violations > 0 )); then
+    echo -e "$(midgard_current_time) ${site} Scan uploads for PHP & executables... ${c_light_blue}[${c_light_red}FAIL${c_light_blue}]${c_reset}"
+    echo   "$(midgard_current_time) Scan uploads for PHP & executables... [FAIL]" >> "${SITE_LOG_FILE}"
+    echo "UPLOADS_PHP=FAIL" >> "${SITE_REPORT_FILE}"
+    return 1
+  fi
+
+  # Determine overall rc (error from find)
+  (( rc_php != 0 ))    && rc=1
+
+  # Cleanup temps
+  rm -f "${tmp_php}"
+
+  # Errors from find?
+  if (( rc != 0 )); then
+    echo -e "$(midgard_current_time) ${site} Scan uploads for PHP & executables... ${c_light_blue}[${c_light_red}FAIL${c_light_blue}]${c_reset}"
+    echo "$(midgard_current_time) Scan uploads for PHP & executables... [FAIL]" >> "${SITE_LOG_FILE}"
+    echo "UPLOADS_PHP=FAIL" >> "${SITE_REPORT_FILE}"
+    return 1
+  fi
+
+  echo -e "$(midgard_current_time) ${site} Scan uploads for PHP & executables... ${c_light_blue}[${c_green}SUCCESS${c_light_blue}]${c_reset}"
+  echo "$(midgard_current_time) Scan uploads for PHP & executables... [SUCCESS]" >> "${SITE_LOG_FILE}"
+  echo "UPLOADS_PHP=OK" >> "${SITE_REPORT_FILE}"
+  return 0
+}

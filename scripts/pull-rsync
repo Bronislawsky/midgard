@@ -1,0 +1,165 @@
+#!/usr/bin/env bash
+# file : ./scripts/pull-rsync
+#------------------------------------------------------------------------------
+#
+#         .__    .___                      .___
+#   _____ |__| __| _/ _________ _______  __| _/
+#  /     \|  |/ __ | / ___\__  \\_  __ \/ __ |
+# |  Y Y  \  / /_/ |/ /_/  > __ \|  | \/ /_/ |
+# |__|_|  /__\____ |\___  (____  /__|  \____ |
+#       \/        \/_____/     \/           \/
+#
+# pull-rsync — rsync remote site files to LOCAL_SYNC_PATH
+#   - requires MIDGARD_MAIN=1 + global config loaded (RSYNC_BIN, retries)
+#   - expects CONFIG_SITES map & SITE_<name> arrays already populated
+#------------------------------------------------------------------------------
+[[ "${MIDGARD_MAIN:-}" == "1" ]] || {
+  echo "This script must be sourced from the midgard launcher." >&2
+  return 1 2>/dev/null || exit 1
+}
+
+pull_rsync_main() {
+  local site="$1"
+
+  mkdir -p "${MIDGARD_SESSION_LOG_DIR}" "${MIDGARD_SESSION_REPORT_DIR}"
+  local SITE_LOG_FILE="${MIDGARD_SESSION_LOG_DIR}/${site}.log"
+  local SITE_REPORT_FILE="${MIDGARD_SESSION_REPORT_DIR}/${site}.report"
+
+  echo -e "$(midgard_current_time) ${site} Remote File Synchronisation ${c_light_blue}[${c_green}STARTED${c_light_blue}]${c_reset}"
+  echo "$(midgard_current_time) Remote File Synchronisation [STARTED]" >> "$SITE_LOG_FILE"
+
+  if [[ -z "$site" ]]; then
+    echo "pull_rsync_main: missing site" >&2
+    echo "$(midgard_current_time)  Remote File Synchronisation [FAILED]" >> "$SITE_LOG_FILE"
+    echo "RSYNC=FAIL" >> "$SITE_REPORT_FILE"
+    return 1
+  fi
+
+  local assoc_name="${CONFIG_SITES[$site]:-}"
+  if [[ -z "$assoc_name" ]]; then
+    echo "pull_rsync_main: site not loaded: $site" >&2
+    echo "$(midgard_current_time)  Remote File Synchronisation [FAILED]" >> "$SITE_LOG_FILE"
+    echo "RSYNC=FAIL" >> "$SITE_REPORT_FILE"
+    return 1
+  fi
+
+  # fetch fields
+  local REMOTE_USER REMOTE_HOST REMOTE_PATH LOCAL_SYNC_PATH INCLUDE_DIRS IGNORE_DIRS SSH_KEY_PRIV
+
+  SITE_SYNC_PATH="$(midgard_get_value_from_array "$assoc_name" LOCAL_SYNC_PATH)"
+  SITE_DOCUMENT_ROOT_PATH="$(midgard_get_value_from_array "$assoc_name" LOCAL_DOCUMENT_ROOT)"
+  SITE_WEB_ROOT_PATH="${SITE_SYNC_PATH}${SITE_DOCUMENT_ROOT_PATH}"
+
+      REMOTE_USER="$(midgard_get_value_from_array "$assoc_name" REMOTE_USER)"
+      REMOTE_HOST="$(midgard_get_value_from_array "$assoc_name" REMOTE_HOST)"
+      REMOTE_PATH="$(midgard_get_value_from_array "$assoc_name" REMOTE_PATH)"
+  LOCAL_SYNC_PATH="$(midgard_get_value_from_array "$assoc_name" LOCAL_SYNC_PATH)"
+     INCLUDE_DIRS="$(midgard_get_value_from_array "$assoc_name" INCLUDE_DIRS)"
+      IGNORE_DIRS="$(midgard_get_value_from_array "$assoc_name" IGNORE_DIRS)"
+     SSH_KEY_PRIV="$(midgard_get_value_from_array "$assoc_name" SSH_KEY_PRIV)"
+
+  # sanity + env
+  local errors=()
+  [[ -x "${RSYNC_BIN:-}" ]]   || errors+=("RSYNC_BIN")
+  [[ -n "$REMOTE_USER"     ]] || errors+=("REMOTE_USER")
+  [[ -n "$REMOTE_HOST"     ]] || errors+=("REMOTE_HOST")
+  [[ -n "$REMOTE_PATH"     ]] || errors+=("REMOTE_PATH")
+  [[ -n "$LOCAL_SYNC_PATH" ]] || errors+=("LOCAL_SYNC_PATH")
+  [[ -r "$SSH_KEY_PRIV"    ]] || errors+=("SSH_KEY_PRIV")
+
+  if (( ${#errors[@]} )); then
+    for err in "${errors[@]}"; do
+      echo -e "$(midgard_current_time) ${site}   Please verify ${c_light_red}${err}${c_reset}"
+    done
+
+    echo -e "$(midgard_current_time) ${site} Remote File Synchronisation ${c_light_blue}[${c_light_red}FAILED${c_light_blue}]${c_reset}"
+    echo "$(midgard_current_time)  Remote File Synchronisation [FAILED]" >> "$SITE_LOG_FILE"
+    echo "RSYNC=FAIL" >> "$SITE_REPORT_FILE"
+    return 1
+  fi
+
+  # normalize slashes
+  [[ "${REMOTE_PATH: -1}" == "/" ]] || REMOTE_PATH="${REMOTE_PATH}/"
+  LOCAL_SYNC_PATH="${LOCAL_SYNC_PATH%/}"
+
+  # ssh wrapper for rsync
+  local -a ssh_opts=(
+    -i "$SSH_KEY_PRIV"
+    -o BatchMode=yes
+    -o StrictHostKeyChecking=accept-new
+    -o ConnectTimeout=15
+  )
+  local rsh="ssh ${ssh_opts[*]}"
+
+  # rsync flags — no --progress to avoid ^M; show itemized changes instead
+  local -a base_flags=(
+    -aHAX
+    --numeric-ids
+    --delete
+    --partial
+    --inplace
+    --human-readable
+    --stats
+    -i                              # itemize changes
+    --out-format='%i %n%L'          # clean per-file lines
+    --no-inc-recursive
+  )
+
+  # excludes from IGNORE_DIRS (full mirror path)
+  local -a excludes=()
+  if [[ -n "$IGNORE_DIRS" && -z "$INCLUDE_DIRS" ]]; then
+    local ex
+    for ex in $IGNORE_DIRS; do
+      excludes+=( "--exclude=/${ex%/}/" )
+      echo -e "$(midgard_current_time) ${site}   Excluding dir : ${c_yellow}${ex}${c_reset}"
+      echo "$(midgard_current_time) ${site}   Excluding dir : ${ex}" >> "$SITE_LOG_FILE"
+    done
+  fi
+
+  # destination setup
+  mkdir -p "$LOCAL_SYNC_PATH"
+
+  local tries="${DEFAULT_RETRIES:-3}"
+  local backoff="${DEFAULT_RETRY_BACKOFF_SECS:-5}"
+  local n rc=0
+
+  if [[ -n "$INCLUDE_DIRS" ]]; then
+    # pull only specific subdirs
+
+    local d
+    for d in $INCLUDE_DIRS; do
+      local src="${REMOTE_USER}@${REMOTE_HOST}:${REMOTE_PATH%/}/${d%/}/"
+      local dst="${LOCAL_SYNC_PATH%/}/${d%/}/"
+      mkdir -p "$dst"
+      rc=0
+      for ((n=1; n<=tries; n++)); do
+        "${RSYNC_BIN}" "${base_flags[@]}" -e "$rsh" -- "$src" "$dst" >> "$SITE_LOG_FILE" 2>&1 && { rc=0; break; } || rc=$?
+        (( n < tries )) && { echo "retry $n/${tries} in ${backoff}s (rc=$rc)" >> "$SITE_LOG_FILE"; sleep "$backoff"; }
+      done
+      (( rc == 0 )) || break
+    done
+  else
+    # full mirror with optional excludes
+    local src="${REMOTE_USER}@${REMOTE_HOST}:${REMOTE_PATH%/}/"
+    local dst="${LOCAL_SYNC_PATH%/}/"
+    rc=0
+    for ((n=1; n<=tries; n++)); do
+      "${RSYNC_BIN}" "${base_flags[@]}" -e "$rsh" "${excludes[@]}" -- "$src" "$dst" >> "$SITE_LOG_FILE" 2>&1 && { rc=0; break; } || rc=$?
+      (( n < tries )) && { echo "retry $n/${tries} in ${backoff}s (rc=$rc)" >> "$SITE_LOG_FILE"; sleep "$backoff"; }
+    done
+  fi
+
+  if (( rc == 0 )); then
+    echo -e "$(midgard_current_time) ${site} Remote File Synchronisation ${c_light_blue}[${c_green}SUCCESS${c_light_blue}]${c_reset}"
+    echo "$(midgard_current_time) Remote File Synchronisation [SUCCESS]" >> "$SITE_LOG_FILE"
+    echo "RSYNC=OK" >> "$SITE_REPORT_FILE"
+  else
+    echo -e "$(midgard_current_time) ${site} Remote File Synchronisation ${c_light_blue}[${c_light_red}FAILED${c_light_blue}]${c_reset}"
+    echo "$(midgard_current_time) Remote File Synchronisation [FAILED]" >> "$SITE_LOG_FILE"
+    echo "RSYNC=FAIL" >> "$SITE_REPORT_FILE"
+  fi
+
+  return "$rc"
+}
+
+

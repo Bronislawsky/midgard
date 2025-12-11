@@ -1,0 +1,64 @@
+#!/usr/bin/env bash
+# file : ./scripts/crypt
+#------------------------------------------------------------------------------
+#
+#         .__    .___                      .___
+#   _____ |__| __| _/ _________ _______  __| _/
+#  /     \|  |/ __ | / ___\__  \\_  __ \/ __ |
+# |  Y Y  \  / /_/ |/ /_/  > __ \|  | \/ /_/ |
+# |__|_|  /__\____ |\___  (____  /__|  \____ |
+#       \/        \/_____/     \/           \/
+#
+# crypt — encrypt/decrypt short strings (interactive, one-line base64)
+# Must be *sourced* by ./midgard (enforces MIDGARD_MAIN=1)
+#------------------------------------------------------------------------------
+
+# Enforce sourcing via main launcher only
+if [[ "${MIDGARD_MAIN:-}" != "1" ]]; then
+  echo "This script must be sourced from the midgard launcher." >&2
+  return 1 2>/dev/null || exit 1
+fi
+
+# --- pick a base64 that disables line wrapping
+_midgard_choose_b64() {
+  if base64 --help 2>/dev/null | grep -q -- ' -w'; then
+    echo "base64 -w0"          # GNU coreutils (Linux)
+  elif base64 --help 2>/dev/null | grep -q -- ' -b'; then
+    echo "base64 -b 0"         # macOS/BSD
+  else
+    echo "base64"              # fallback; we strip newlines after
+  fi
+}
+
+# --- encrypt (AES256) ---
+midgard_encstr() {
+  local pass plaintext b64
+  read -rs -p "Encryption Key : " pass; echo
+  read -rs -p "Unencrypted String : " plaintext; echo
+  b64=$(_midgard_choose_b64)
+  # passphrase via fd 3; plaintext via stdin; base64 to single line
+  exec 3<<<"$pass"
+  printf %s "$plaintext" | gpg --batch --yes --pinentry-mode loopback \
+    --passphrase-fd 3 --symmetric --cipher-algo AES256 \
+    | eval "$b64" | tr -d '\n'
+  echo
+  exec 3<&-
+  # Do NOT echo the key back for safety
+}
+
+# --- decrypt ---
+midgard_decstr() {
+  local pass enc_b64
+  read -rs -p "Encryption Key : " pass; echo
+  read -r  -p "Encrypted String : " enc_b64
+  exec 3<<<"$pass"
+  # decode base64, then decrypt
+  if ! printf %s "$enc_b64" | base64 -d 2>/dev/null | \
+       gpg --batch --yes --pinentry-mode loopback --passphrase-fd 3 --decrypt; then
+    echo "Decryption failed (bad base64 or wrong key?)." >&2
+    exec 3<&-
+    return 1 2>/dev/null || exit 1
+  fi
+  echo -e ""
+  exec 3<&-
+}

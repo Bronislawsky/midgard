@@ -1,0 +1,196 @@
+#!/usr/bin/env bash
+# file : ./scripts/sendmail-site
+#------------------------------------------------------------------------------
+#
+#         .__    .___                      .___
+#   _____ |__| __| _/ _________ _______  __| _/
+#  /     \|  |/ __ | / ___\__  \\_  __ \/ __ |
+# |  Y Y  \  / /_/ |/ /_/  > __ \|  | \/ /_/ |
+# |__|_|  /__\____ |\___  (____  /__|  \____ |
+#       \/        \/_____/     \/           \/
+#
+# sendmail-site — email the PDF report for a site
+#   - must be sourced by ./midgard (MIDGARD_MAIN=1)
+#   - uses CONFIG_SITES + EPOCH_TIMESTAMP + status_* helpers
+#   - reads global SMTP_* from midgard.conf
+#   - logs to   ./logs/$EPOCH_TIMESTAMP/<site>.log
+#   - attaches  ./reports/$EPOCH_TIMESTAMP/<site>.pdf
+#   - exit 0 on success (or when skipped); 1 on failure
+#------------------------------------------------------------------------------
+
+# Safety guard
+if [[ "${MIDGARD_MAIN:-}" != "1" ]]; then
+  echo "This script must be sourced from the midgard launcher." >&2
+  return 1 2>/dev/null || exit 1
+fi
+
+# Emoji for failed reports
+FAIL_CHAR="❌"  # U+274C
+
+# name-ref getter: _get <assoc_array_name> <key>
+_get() {
+  local __arr="$1" __key="$2"
+  declare -n __ref="$__arr"
+  printf '%s' "${__ref[$__key]-}"
+}
+
+sendmail_site_report() {
+  local site="${1:-}"
+  [[ -n "$site" ]] || { echo "sendmail_site_report: missing site"; return 1; }
+
+  # Site config map must be loaded
+  local arr="${CONFIG_SITES[$site]:-}"
+  [[ -n "$arr" ]] || { echo "sendmail_site_report: site not loaded: $site"; return 1; }
+
+  # Per-site mail settings
+  local REPORTING_ENABLE REPORTING_EMAILS
+  REPORTING_ENABLE="$(_get "$arr" REPORTING_ENABLE)"
+  REPORTING_EMAILS="$(_get "$arr" REPORTING_EMAILS)"
+
+  local log_dir="logs/${EPOCH_TIMESTAMP}"
+  local rep_dir="reports/${EPOCH_TIMESTAMP}"
+  local rep_file="${rep_dir}/${site}.report"
+  local site_log="${log_dir}/${site}.log"
+  local site_pdf="${rep_dir}/${site}.pdf"
+  local site_html="${rep_dir}/${site}.html"
+  mkdir -p "$log_dir" "$rep_dir"
+
+  # Respect per-site toggle
+  if [[ "${REPORTING_ENABLE}" != "y" ]]; then
+    echo "  email ${site} ... [SKIPPED]" | tee -a "$site_log"
+    return 0
+  fi
+
+  # Validate recipients
+  if [[ -z "${REPORTING_EMAILS// }" ]]; then
+    echo "  email ${site} ... " | tee -a "$site_log"
+    echo "    - no recipients (REPORTING_EMAILS empty) [FAIL]" | tee -a "$site_log"
+    return 1
+  fi
+
+  # Validate PDF
+  if [[ ! -s "$site_pdf" ]]; then
+    echo "  email ${site} ... " | tee -a "$site_log"
+    echo "    - missing PDF: ${site_pdf} [FAIL]" | tee -a "$site_log"
+    [[ -f "$site_html" ]] && echo "    - HTML present for debug: ${site_html}" | tee -a "$site_log"
+    return 1
+  fi
+
+  # Global SMTP config
+  : "${SMTP_HOST:?SMTP_HOST missing}"
+  : "${SMTP_PORT:?SMTP_PORT missing}"
+  : "${SMTP_FROM:?SMTP_FROM missing}"
+  : "${SMTP_TLS:=y}"
+  : "${SMTP_USER:=}"
+  : "${SMTP_PASS:=}"
+
+  # Build subject, prefixing on FAIL
+  local subject
+  if [ -n "$rep_file" ] && grep -q "=FAIL" "$rep_file"; then
+    subject="${FAIL_CHAR} Midgard Backup Report - ${site} - ${EPOCH_TIMESTAMP}"
+  else
+    subject="Midgard Backup Report - ${site} - ${EPOCH_TIMESTAMP}"
+  fi
+
+  local human_date
+  human_date="$(date -d "@$EPOCH_TIMESTAMP" '+%Y-%m-%d %H:%M:%S %Z' 2>/dev/null || date -r "$EPOCH_TIMESTAMP" '+%Y-%m-%d %H:%M:%S %Z')"
+
+  status_start "  email ${site} ..."
+
+  # IMPORTANT: redirections BEFORE the heredoc; 'then' only AFTER closing PY.
+  if ! env -i \
+      PATH="$PATH" \
+      LANG=C.UTF-8 LC_ALL=C.UTF-8 \
+      SMTP_HOST="$SMTP_HOST" \
+      SMTP_PORT="$SMTP_PORT" \
+      SMTP_USER="$SMTP_USER" \
+      SMTP_PASS="$SMTP_PASS" \
+      SMTP_FROM="$SMTP_FROM" \
+      SMTP_TLS="$SMTP_TLS" \
+      REPORTING_EMAILS="$REPORTING_EMAILS" \
+      SITE_NAME="$site" \
+      EPOCH_TS="$EPOCH_TIMESTAMP" \
+      HUMAN_DATE="$human_date" \
+      PDF_PATH="$site_pdf" \
+      SUBJECT="$subject" \
+      python3 - >>"$site_log" 2>&1 <<'PY'
+import os, smtplib
+from email.message import EmailMessage
+
+host = os.environ["SMTP_HOST"]
+port = int(os.environ.get("SMTP_PORT","587"))
+user = os.environ.get("SMTP_USER","")
+pw   = os.environ.get("SMTP_PASS","")
+mail_from = os.environ["SMTP_FROM"]
+use_tls = os.environ.get("SMTP_TLS","y").lower().startswith("y")
+
+site = os.environ["SITE_NAME"]
+epoch = os.environ["EPOCH_TS"]
+human_date = os.environ["HUMAN_DATE"]
+pdf = os.environ["PDF_PATH"]
+subject = os.environ["SUBJECT"]
+
+# Recipients: comma and/or space separated (support both)
+raw_rcpts = os.environ.get("REPORTING_EMAILS","")
+# normalize commas into spaces then split on whitespace
+rcpts = [t for t in raw_rcpts.replace(",", " ").split() if t]
+if not rcpts:
+    raise SystemExit("No recipients")
+
+# Build message (ASCII-safe)
+msg = EmailMessage()
+msg["From"] = mail_from
+# put a readable To: header (comma-separated)
+msg["To"] = ", ".join(rcpts)
+msg["Subject"] = subject
+
+body = f"""Midgard backup report
+
+Site: {site}
+Epoch: {epoch}
+Date:  {human_date}
+
+The PDF report (Letter 8.5x11) is attached.
+
+Notice (EN):
+If you see any error in this report, please inform your hostmaster. He or she may already be informed, but please contact them anyway.
+
+Avis (FR):
+Si vous voyez une erreur dans ce rapport, veuillez en informer votre hostmaster. Il est peut-etre deja au courant, mais contactez-le quand meme.
+
+Aviso (ES):
+Si ve alguna falla en este informe, informe a su hostmaster. Puede que ya este al tanto, pero comuniquese con el de todas formas.
+"""
+msg.set_content(body)
+
+with open(pdf, "rb") as f:
+    data = f.read()
+filename = f"{site}-{epoch}.pdf"
+msg.add_attachment(data, maintype="application", subtype="pdf", filename=filename)
+
+# Send using the envelope recipients explicitly to ensure delivery to all addresses.
+if use_tls:
+    with smtplib.SMTP(host, port, timeout=30) as s:
+        s.ehlo()
+        s.starttls()
+        s.ehlo()
+        if user and pw:
+            s.login(user, pw)
+        s.send_message(msg, to_addrs=rcpts)   # <<-- fixed: pass as to_addrs keyword
+else:
+    with smtplib.SMTP(host, port, timeout=30) as s:
+        s.ehlo()
+        if user and pw:
+            s.login(user, pw)
+        s.send_message(msg, to_addrs=rcpts)   # <<-- fixed here as well
+PY
+  then
+    status_fail
+    echo "    - send failed (SMTP or network error)" | tee -a "$site_log"
+    return 1
+  fi
+
+  status_ok
+  echo "    - sent ${site_pdf}" | tee -a "$site_log"
+  return 0
+}

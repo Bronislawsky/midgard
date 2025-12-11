@@ -1,0 +1,289 @@
+#!/usr/bin/env bash
+# file : ./scripts/scan-wordfence-db
+#------------------------------------------------------------------------------
+#
+#         .__    .___                      .___
+#   _____ |__| __| _/ _________ _______  __| _/
+#  /     \|  |/ __ | / ___\__  \\_  __ \/ __ |
+# |  Y Y  \  / /_/ |/ /_/  > __ \|  | \/ /_/ |
+# |__|_|  /__\____ |\___  (____  /__|  \____ |
+#       \/        \/_____/     \/           \/
+#
+# scan-wordfence-db
+#------------------------------------------------------------------------------
+[[ "${MIDGARD_MAIN:-}" == "1" ]] || {
+  echo "This script must be sourced from the midgard launcher." >&2
+  return 1 2>/dev/null || exit 1
+}
+
+scan_wordfence_db_main() {
+
+  local site="$1"
+
+
+  mkdir -p "${MIDGARD_SESSION_LOG_DIR}" "${MIDGARD_SESSION_REPORT_DIR}"
+  local SITE_LOG_FILE="${MIDGARD_SESSION_LOG_DIR}/${site}.log"
+  local SITE_REPORT_FILE="${MIDGARD_SESSION_REPORT_DIR}/${site}.report"
+
+  if [[ -z "$site" ]]; then
+    echo "scan_wordfence_db_main: missing site" >&2
+    echo "$(midgard_current_time) Wordfence-CLI Database Scan [FAILED]" >> "$SITE_LOG_FILE"
+    echo "WORDFENCE_DB=FAIL" >> "$SITE_REPORT_FILE"
+    return 1
+  fi
+
+  local assoc_name="${CONFIG_SITES[$site]:-}"
+  if [[ -z "$assoc_name" ]]; then
+    echo "scan_wordfence_db_main: site not loaded: $site" >&2
+    echo "$(midgard_current_time) Wordfence-CLI Database Scan" >> "$SITE_LOG_FILE"
+    echo "WORDFENCE_DB=FAIL" >> "$SITE_REPORT_FILE"
+    return 1
+  fi
+
+  # Per-site toggles & values (from sites-data / .conf already loaded)
+  local WORDFENCE_ENABLE_DB WORDFENCE_DB_REMOVE_POST
+  local DB_USER DB_PASS DB_HOST DB_NAME DB_PREFIX
+  local LOCAL_SYNC_PATH LOCAL_SQL_PATH LOCAL_SQL_FILE
+
+  WORDFENCE_ENABLE_DB="$(midgard_get_value_from_array "$assoc_name" WORDFENCE_ENABLE_DB)"
+
+  if [[ "$WORDFENCE_ENABLE_DB" != "y" ]]; then
+    echo -e "$(midgard_current_time) ${site} Wordfence-CLI Database Scan ${c_light_blue}[${c_light_red}DISABLED${c_light_blue}]${c_reset}"
+    echo "$(midgard_current_time) Wordfence-CLI Database Scan [DISABLED]" >> "${SITE_LOG_FILE}"
+    echo "WORDFENCE_DB=SKIPPED" >> "${SITE_REPORT_FILE}"
+    return 0
+  fi
+
+  echo -e "$(midgard_current_time) ${site} Wordfence-CLI Database Scan ${c_light_blue}[${c_green}STARTED${c_light_blue}]${c_reset}"
+  echo "$(midgard_current_time) Wordfence-CLI Database Scan [STARTED]" >> "$SITE_LOG_FILE"
+
+  DB_USER="$(midgard_get_value_from_array "$assoc_name" DB_USER)"
+  DB_PASS="$(midgard_get_value_from_array "$assoc_name" DB_PASS)"
+  DB_HOST="$(midgard_get_value_from_array "$assoc_name" DB_HOST)"
+  DB_NAME="$(midgard_get_value_from_array "$assoc_name" DB_NAME)"
+  DB_PREFIX="$(midgard_get_value_from_array "$assoc_name" DB_PREFIX)"
+
+  LOCAL_SYNC_PATH="$(midgard_get_value_from_array "$assoc_name" LOCAL_SYNC_PATH)"
+  LOCAL_SQL_PATH="$(midgard_get_value_from_array "$assoc_name" LOCAL_SQL_PATH)"
+  LOCAL_SQL_FILE="$(midgard_get_value_from_array "$assoc_name" LOCAL_SQL_FILE)"
+
+  WORDFENCE_DB_REMOVE_POST="$(midgard_get_value_from_array "$assoc_name" WORDFENCE_DB_REMOVE_POST)"
+
+  # sanity + env
+  local errors=()
+  [[ -n "$DB_USER"     ]] || errors+=("DB_USER")
+  [[ -n "$DB_PASS"     ]] || errors+=("DB_PASS")
+  [[ -n "$DB_HOST"     ]] || errors+=("DB_HOST")
+  [[ -n "$DB_NAME"     ]] || errors+=("DB_NAME")
+  [[ -n "$DB_PREFIX"   ]] || errors+=("DB_PREFIX")
+
+  [[ -n "$LOCAL_SYNC_PATH" ]] || errors+=("LOCAL_SYNC_PATH")
+  [[ -n "$LOCAL_SQL_PATH"  ]] || errors+=("LOCAL_SQL_PATH")
+  [[ -n "$LOCAL_SQL_FILE"  ]] || errors+=("LOCAL_SQL_FILE")
+
+  [[ -x "$WORDFENCE_BIN" ]] || errors+=("WORDFENCE_BIN")
+  [[ -x "$MYSQL_BIN"     ]] || errors+=("MYSQL_BIN")
+
+  if (( ${#errors[@]} )); then
+    for err in "${errors[@]}"; do
+      echo -e "$(midgard_current_time) ${site}   Please verify ${c_light_red}${err}${c_reset}"
+    done
+    echo -e "$(midgard_current_time) ${site} Wordfence-CLI Database Scan ${c_light_blue}[${c_light_red}FAILED${c_light_blue}]${c_reset}"
+    echo "$(midgard_current_time) Wordfence-CLI Database Scan [FAILED]" >> "$SITE_LOG_FILE"
+    echo "WORDFENCE_DB=FAIL" >> "${SITE_REPORT_FILE}"
+    return 1
+  fi
+
+  # Locate SQL dump
+  local sql_file="${LOCAL_SYNC_PATH%/}${LOCAL_SQL_PATH%/}/${LOCAL_SQL_FILE}"
+  if [[ ! -s "$sql_file" ]]; then
+    echo -e "$(midgard_current_time) ${site} Wordfence-CLI Database Scan ${c_light_blue}[${c_light_red}FAILED${c_light_blue}]${c_reset}"
+    echo "$(midgard_current_time) Wordfence-CLI Database Scan [FAILED]" >> "$SITE_LOG_FILE"
+    echo "WORDFENCE_DB=FAIL" >> "${SITE_REPORT_FILE}"
+    return 1
+  fi
+
+  echo -e "$(midgard_current_time) ${site}   Dropping any existing database ${c_yellow}${DB_NAME}${c_reset}"
+  echo "$(midgard_current_time)    Dropping any existing database ${DB_NAME}" >> "$SITE_LOG_FILE"
+  echo -e "$(midgard_current_time) ${site}   Creating database ${c_yellow}${DB_NAME}${c_reset}"
+  echo "$(midgard_current_time)    Creating database ${DB_NAME}" >> "$SITE_LOG_FILE"
+  echo -e "$(midgard_current_time) ${site}   Dropping any existing user ${c_yellow}${DB_USER}${c_reset}"
+  echo "$(midgard_current_time)    Dropping any existing database ${DB_USER}" >> "$SITE_LOG_FILE"
+  echo -e "$(midgard_current_time) ${site}   Creating user ${c_yellow}${DB_USER}${c_reset}"
+  echo "$(midgard_current_time)    Creating user ${DB_USER}" >> "$SITE_LOG_FILE"
+  echo -e "$(midgard_current_time) ${site}   Granting all privileges to ${c_yellow}${DB_USER}${c_reset}"
+  echo "$(midgard_current_time)    Granting all privileges to  ${DB_USER}" >> "$SITE_LOG_FILE"
+  {
+    echo "DROP DATABASE IF EXISTS \`${DB_NAME}\`;"
+    echo "CREATE DATABASE \`${DB_NAME}\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;"
+    echo "DROP USER IF EXISTS '${DB_USER}'@'localhost';"
+    echo "CREATE USER '${DB_USER}'@'localhost' IDENTIFIED BY '${DB_PASS}';"
+    echo "GRANT ALL PRIVILEGES ON \`${DB_NAME}\`.* TO '${DB_USER}'@'localhost';"
+    echo "FLUSH PRIVILEGES;"
+  } | sudo -n "$MYSQL_BIN" -N -B >> "$SITE_LOG_FILE" 2>&1 || {
+    echo -e "$(midgard_current_time) ${site} Wordfence-CLI Database Scan ${c_light_blue}[${c_light_red}FAILED${c_light_blue}]${c_reset}"
+    echo "$(midgard_current_time) Wordfence-CLI Database Scan [FAILED]" >> "$SITE_LOG_FILE"
+    echo "WORDFENCE_DB=FAIL" >> "${SITE_REPORT_FILE}"
+    return 1
+  }
+
+  # Import the dump
+  if ! sudo -n "$MYSQL_BIN" "$DB_NAME" < "$sql_file" >> "$SITE_LOG_FILE" 2>&1; then
+    echo -e "$(midgard_current_time) ${site} Wordfence-CLI Database Scan ${c_light_blue}[${c_light_red}FAILED${c_light_blue}]${c_reset}"
+    echo "$(midgard_current_time) Wordfence-CLI Database Scan [FAILED]" >> "$SITE_LOG_FILE"
+    echo "WORDFENCE_DB=FAIL" >> "${SITE_REPORT_FILE}"
+    return 1
+  fi
+
+  # Quick connection sanity
+  if ! "$MYSQL_BIN" -h "$DB_HOST" -u"$DB_USER" -p"$DB_PASS" -e "SELECT 1;" "$DB_NAME" >> "$SITE_LOG_FILE" 2>&1; then
+    echo -e "$(midgard_current_time) ${site} Wordfence-CLI Database Scan ${c_light_blue}[${c_light_red}FAILED${c_light_blue}]${c_reset}"
+    echo "$(midgard_current_time) Wordfence-CLI Database Scan [FAILED]" >> "$SITE_LOG_FILE"
+    echo "WORDFENCE_DB=FAIL" >> "${SITE_REPORT_FILE}"
+    return 1
+  fi
+
+  # Optional: prune specific posts before scanning (plus related rows)
+  if [[ -n "${WORDFENCE_DB_REMOVE_POST// }" ]]; then
+    local  one
+    for one in $WORDFENCE_DB_REMOVE_POST; do
+      [[ "$one" =~ ^[0-9]+$ ]] || continue
+      echo -e "$(midgard_current_time) ${site}   Pruning post : ${c_yellow}$one${c_reset}"
+      echo "$(midgard_current_time)    Pruning post : $one" >> "$SITE_LOG_FILE"
+
+{
+      cat <<SQL
+SET FOREIGN_KEY_CHECKS=0;
+DELETE FROM \`${DB_PREFIX}postmeta\` WHERE post_id=${one};
+DELETE FROM \`${DB_PREFIX}term_relationships\` WHERE object_id=${one};
+DELETE FROM \`${DB_PREFIX}posts\` WHERE ID=${one};
+SET FOREIGN_KEY_CHECKS=1;
+SQL
+    } | sudo -n "$MYSQL_BIN" "$DB_NAME" >>"$SITE_LOG_FILE" 2>&1 || {
+      echo -e "$(midgard_current_time) ${site}   ${c_light_red}FAILED${c_reset} pruning post ${one}"
+      echo "$(midgard_current_time)    FAILED pruning post ${one}" >> "$SITE_LOG_FILE"
+      continue
+    }
+    done
+  fi
+
+  # Run Wordfence DB scan
+  local rc=0
+  local tmp_count_file="$(mktemp -t ${site}.wordfencecli-db.XXXXXXXX.tmp)"
+  local tmp_count=0
+  local prune_post=""
+  export WFCLI_DB_PASSWORD="$DB_PASS"
+  scan_output="$("$WORDFENCE_BIN" db-scan \
+    --accept-terms \
+    --no-cache \
+    --host "$DB_HOST" \
+    --user "$DB_USER" \
+    --password-env WFCLI_DB_PASSWORD \
+    --database-name "$DB_NAME" \
+    --prefix "$DB_PREFIX" \
+    --output-format csv \
+    --no-output-headers \
+    --quiet)"
+  rc=$?
+
+  # RC failed
+  if (( $rc != 0)); then
+    echo -e "$(midgard_current_time) ${site} Wordfence-CLI Database Scan ${c_light_blue}[${c_light_red}FAILED${c_light_blue}]${c_reset}"
+    echo "$(midgard_current_time) Wordfence-CLI Database Scan [FAILED]" >> "$SITE_LOG_FILE"
+    echo "WORDFENCE_DB=FAIL" >> "${SITE_REPORT_FILE}"
+    return 1
+  fi
+
+  printf '%s\n' "$scan_output" > "$tmp_count_file"
+  tmp_count=$(awk 'NF{c++} END{print c+0}' "$tmp_count_file")
+
+  while IFS= read -r line; do
+    [[ -z "$line" ]] && continue
+      # Turn doubled quotes into single quotes so the JSON-ish bit becomes "id": 1219
+    clean=${line//\"\"/\"}
+    if [[ $clean =~ \"id\"[[:space:]]*:[[:space:]]*([0-9]+) ]]; then
+      echo -e "$(midgard_current_time) ${site}   Suspicious post id ${c_light_red}${BASH_REMATCH[1]}${c_reset}"
+      echo "$(midgard_current_time)    Suspicious post id ${BASH_REMATCH[1]}" >> "$SITE_LOG_FILE"
+      prune_post="$prune_post ${BASH_REMATCH[1]}"
+    fi
+  done < "$tmp_count_file"
+
+  [[ ! -n "$prune_post" ]] || {
+    echo "$(midgard_current_time)    Suspicious posts : $prune_post" >> "$SITE_LOG_FILE"
+  }
+
+  # ---- Preview suspicious posts: title + short content snippet ----
+  # Length of the content preview (can be overridden per-site in conf)
+  local PREVIEW_LEN="${WORDFENCE_DB_PREVIEW_LEN:-80}"
+
+  if [[ -n "${prune_post// }" ]]; then
+    echo -e "$(midgard_current_time) ${site}   Previewing suspicious posts (title + ${PREVIEW_LEN} chars):"
+    # Build a clean numeric list for the SQL IN() clause
+    local ids_csv=""
+    for one in $prune_post; do
+      [[ "$one" =~ ^[0-9]+$ ]] || continue
+      if [[ -z "$ids_csv" ]]; then ids_csv="$one"; else ids_csv+=",${one}"; fi
+    done
+
+    if [[ -n "$ids_csv" ]]; then
+      # Note: Use REPLACE(…, CHAR(10/13/9),' ') to flatten whitespace; LEFT() to clip.
+      # We avoid REGEXP_REPLACE for broad compatibility (MySQL 5.7 / older MariaDB).
+      local sql="
+        SELECT
+          ID,
+          post_type,
+          post_status,
+          LEFT(post_title, 200) AS title_short,
+          LEFT(
+            REPLACE(REPLACE(REPLACE(post_content, CHAR(10),' '), CHAR(13),' '), CHAR(9),' ')
+          , ${PREVIEW_LEN}) AS content_snippet
+        FROM \`${DB_PREFIX}posts\`
+        WHERE ID IN (${ids_csv})
+        ORDER BY ID ASC;
+      "
+
+      # -N -B => tab-separated, no headers. We read each row and pretty-print to console/log.
+      while IFS=$'\t' read -r pid ptype pstatus ptitle psnippet; do
+        [[ -z "$pid" ]] && continue
+        # Collapse repeated spaces in the snippet for readability.
+        local snippet_clean
+        snippet_clean="$(printf '%s' "$psnippet" | tr -s ' ')"
+
+        echo -e "$(midgard_current_time) ${site}     ↳ id ${c_yellow}${pid}${c_reset} [${ptype}/${pstatus}] title: ${c_light_blue}${ptitle}${c_reset} :: ${snippet_clean}"
+        echo "$(midgard_current_time)    Suspicious post preview | id=$pid | type=$ptype | status=$pstatus | title=$ptitle | snippet=$snippet_clean" >> "$SITE_LOG_FILE"
+      done < <(sudo -n "$MYSQL_BIN" -N -B "$DB_NAME" -e "$sql" 2>>"$SITE_LOG_FILE")
+    fi
+  fi
+
+  # RC failed
+  if (( $tmp_count != 0)); then
+    echo -e "$(midgard_current_time) ${site} Wordfence-CLI Database Scan ${c_light_blue}[${c_light_red}FAILED${c_light_blue}]${c_reset}"
+    echo "$(midgard_current_time) Wordfence-CLI Database Scan [FAILED]" >> "$SITE_LOG_FILE"
+    echo "WORDFENCE_DB=FAIL" >> "${SITE_REPORT_FILE}"
+    return 1
+  fi
+
+   echo -e "$(midgard_current_time) ${site} Wordfence-CLI Database Scan ${c_light_blue}[${c_green}SUCCESS${c_light_blue}]${c_reset}"
+   echo "$(midgard_current_time) Wordfence-CLI Database Scan [SUCCESS]" >> "$SITE_LOG_FILE"
+   echo "WORDFENCE_DB=OK" >> "${SITE_REPORT_FILE}"
+   return 0
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

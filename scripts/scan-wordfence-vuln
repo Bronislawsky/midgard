@@ -1,0 +1,145 @@
+#!/usr/bin/env bash
+# file : ./scripts/scan-wordfence-vuln
+#------------------------------------------------------------------------------
+#
+#         .__    .___                      .___
+#   _____ |__| __| _/ _________ _______  __| _/
+#  /     \|  |/ __ | / ___\__  \\_  __ \/ __ |
+# |  Y Y  \  / /_/ |/ /_/  > __ \|  | \/ /_/ |
+# |__|_|  /__\____ |\___  (____  /__|  \____ |
+#       \/        \/_____/     \/           \/
+#
+# scan-wordfence-vuln — Wordfence CLI vuln scan against a site's WP root
+#   - must be sourced by ./midgard (MIDGARD_MAIN=1)
+#   - uses CONFIG_SITES + EPOCH_TIMESTAMP + status_* helpers
+#   - logs to   ./logs/$EPOCH_TIMESTAMP/<site>.log
+#   - any vulnerability found => FAIL (human review required)
+#------------------------------------------------------------------------------
+[[ "${MIDGARD_MAIN:-}" == "1" ]] || {
+  echo "This script must be sourced from the midgard launcher." >&2
+  return 1 2>/dev/null || exit 1
+}
+
+scan_wordfence_vuln_main() {
+
+  local site="$1"
+
+  mkdir -p "${MIDGARD_SESSION_LOG_DIR}" "${MIDGARD_SESSION_REPORT_DIR}"
+  local SITE_LOG_FILE="${MIDGARD_SESSION_LOG_DIR}/${site}.log"
+  local SITE_REPORT_FILE="${MIDGARD_SESSION_REPORT_DIR}/${site}.report"
+
+  if [[ -z "$site" ]]; then
+    echo "scan_wordfence_vuln_main: missing site" >&2
+    echo "$(midgard_current_time) Wordfence-CLI vulnerability Scan [FAILED]" >> "$SITE_LOG_FILE"
+    echo "WORDFENCE_VULN=FAIL" >> "$SITE_REPORT_FILE"
+    return 1
+  fi
+
+  local assoc_name="${CONFIG_SITES[$site]:-}"
+  if [[ -z "$assoc_name" ]]; then
+    echo "scan_wordfence_vuln_main: site not loaded: $site" >&2
+    echo "$(midgard_current_time) Wordfence-CLI vulnerability Scan" >> "$SITE_LOG_FILE"
+    echo "WORDFENCE_VULN=FAIL" >> "$SITE_REPORT_FILE"
+    return 1
+  fi
+
+  # Per-site toggles & values (from sites-data / .conf already loaded)
+  local LOCAL_SYNC_PATH LOCAL_DOCUMENT_ROOT LOCAL_WP_ROOT
+  local WORDFENCE_VULN_ENABLE
+
+  WORDFENCE_VULN_ENABLE="$(midgard_get_value_from_array "$assoc_name" WORDFENCE_VULN_ENABLE)"
+
+  if [[ "$WORDFENCE_VULN_ENABLE" != "y" ]]; then
+    echo -e "$(midgard_current_time) ${site} Wordfence-CLI vulnerability Scan ${c_light_blue}[${c_light_red}DISABLED${c_light_blue}]${c_reset}"
+    echo "$(midgard_current_time) Wordfence-CLI vulnerability Scan [DISABLED]" >> "${SITE_LOG_FILE}"
+    echo "WORDFENCE_VULN=SKIPPED" >> "${SITE_REPORT_FILE}"
+    return 0
+  fi
+
+  echo -e "$(midgard_current_time) ${site} Wordfence-CLI vulnerability Scan ${c_light_blue}[${c_green}STARTED${c_light_blue}]${c_reset}"
+  echo "$(midgard_current_time) Wordfence-CLI Vulnerability Scan [STARTED]" >> "$SITE_LOG_FILE"
+
+  LOCAL_SYNC_PATH="$(midgard_get_value_from_array "$assoc_name" LOCAL_SYNC_PATH)"
+  LOCAL_DOCUMENT_ROOT="$(midgard_get_value_from_array "$assoc_name" LOCAL_DOCUMENT_ROOT)"
+  LOCAL_WP_ROOT="${LOCAL_SYNC_PATH%/}${LOCAL_DOCUMENT_ROOT}"
+
+  # Ensure LOCAL_WP_ROOT has a trailing slash for Wordfence CLI
+  [[ "$LOCAL_WP_ROOT" != */ ]] && LOCAL_WP_ROOT="${LOCAL_WP_ROOT}/"
+
+  # sanity + env
+  local errors=()
+  [[ -n "$LOCAL_SYNC_PATH" ]] || errors+=("LOCAL_SYNC_PATH")
+  [[ -n "$LOCAL_DOCUMENT_ROOT"  ]] || errors+=("LOCAL_DOCUMENT_ROOT")
+  [[ -n "$LOCAL_WP_ROOT"  ]] || errors+=("LOCAL_WP_ROOT")
+  [[ -x "$WORDFENCE_BIN" ]] || errors+=("WORDFENCE_BIN")
+
+  if (( ${#errors[@]} )); then
+    for err in "${errors[@]}"; do
+      echo -e "$(midgard_current_time) ${site}   Please verify ${c_light_red}${err}${c_reset}"
+    done
+    echo -e "$(midgard_current_time) ${site} Wordfence-CLI vulnerability Scan ${c_light_blue}[${c_light_red}FAILED${c_light_blue}]${c_reset}"
+    echo "$(midgard_current_time) Wordfence-CLI vulnerability Scan [FAILED]" >> "$SITE_LOG_FILE"
+    echo "WORDFENCE_VULN=FAIL" >> "${SITE_REPORT_FILE}"
+    return 1
+  fi
+
+  # run scan (CSV only, silence INFO)
+  local scan_csv
+  scan_csv="$(mktemp)"
+
+  set -o pipefail
+  "$WORDFENCE_BIN" vuln-scan \
+      --no-banner \
+      --no-color \
+      --no-verbose \
+      --quiet \
+      --accept-terms \
+      --output-format=csv \
+      --allow-io-errors \
+      "$LOCAL_WP_ROOT" \
+  | tee -a "$SITE_LOG_FILE" >"$scan_csv"
+  rc1=$?
+  set +o pipefail
+
+  if (( rc1 != 0 )); then
+    echo -e "$(midgard_current_time) ${site} Wordfence-CLI vulnerability Scan ${c_light_blue}[${c_light_red}FAILED (rc=$rc1)${c_light_blue}]${c_reset}"
+    echo "$(midgard_current_time) Wordfence-CLI vulnerability Scan [FAILED rc=$rc1]" >> "$SITE_LOG_FILE"
+    echo "WORDFENCE_VULN=FAIL" >> "$SITE_REPORT_FILE"
+    rm -f "$scan_csv"
+    return 1
+  fi
+
+  # Parse CSV safely with gawk (handles quoted fields and commas)
+  # Title is the 5th column. We only accept rows where col1 is plugin/theme/core.
+  mapfile -t vuln_titles < <(
+    gawk -v FPAT='([^,]*)|("([^"]|"")*")' -F',' '
+      ($1=="plugin" || $1=="theme" || $1=="core") {
+        t=$5
+        # strip surrounding quotes if present
+        sub(/^"/,"",t); sub(/"$/,"",t)
+        # unescape double-quotes inside quoted fields
+        gsub(/""/,"\"",t)
+        print t
+      }
+    ' "$scan_csv"
+  )
+
+  rm -f "$scan_csv"
+
+  if ((${#vuln_titles[@]} > 0)); then
+    for t in "${vuln_titles[@]}"; do
+      echo -e "$(midgard_current_time) ${site}   Vulnerability found : ${c_light_red}$t${c_reset}"
+      echo "$(midgard_current_time)   Vulnerability found : $t" >> "$SITE_LOG_FILE"
+    done
+    echo "WORDFENCE_VULN=FAIL" >> "$SITE_REPORT_FILE"
+    echo -e "$(midgard_current_time) ${site} Wordfence-CLI vulnerability Scan ${c_light_blue}[${c_light_red}FAILED${c_light_blue}]${c_reset}"
+    echo "$(midgard_current_time)  Wordfence-CLI vulnerability Scan [FAILED]" >> "$SITE_LOG_FILE"
+    return 1
+  else
+    echo -e "$(midgard_current_time) ${site} Wordfence-CLI vulnerability Scan ${c_light_blue}[${c_green}SUCCESS${c_light_blue}]${c_reset}"
+    echo "$(midgard_current_time) Wordfence-CLI vulnerability Scan [SUCCESS]" >> "$SITE_LOG_FILE"
+    echo "WORDFENCE_VULN=OK" >> "$SITE_REPORT_FILE"
+    return 0
+  fi
+
+}

@@ -1,0 +1,138 @@
+#!/usr/bin/env bash
+# file : ./scripts/aws-policy
+#------------------------------------------------------------------------------
+#
+#         .__    .___                      .___
+#   _____ |__| __| _/ _________ _______  __| _/
+#  /     \|  |/ __ | / ___\__  \\_  __ \/ __ |
+# |  Y Y  \  / /_/ |/ /_/  > __ \|  | \/ /_/ |
+# |__|_|  /__\____ |\___  (____  /__|  \____ |
+#       \/        \/_____/     \/           \/
+#
+# aws-policy — generate IAM names and an S3 prefix policy JSON
+#
+# Usage (from launcher):
+#   ./midgard aws-policy <bucket-domain> <prefix-domain>
+#
+# Example:
+#   ./midgard aws-policy midgard.example.ca example.com
+#
+# Notes:
+#   - Bucket/domain/prefix are normalized to lowercase.
+#   - ARN bucket component uses dashes (dots -> dashes).
+#   - Refuses invalid characters (only: a-z 0-9 . -).
+#------------------------------------------------------------------------------
+
+[[ "${MIDGARD_MAIN:-}" == "1" ]] || {
+  echo "This script must be sourced from the midgard launcher." >&2
+  return 1 2>/dev/null || exit 1
+}
+
+# Validate a "domain-like" token: letters, digits, dots, dashes (no spaces)
+# Allows multi-label domains like "a.b-c.example"
+_aws_policy_validate_domain_like() {
+  local s="$1"
+  [[ -n "$s" ]] || return 1
+  [[ "$s" =~ ^[a-zA-Z0-9.-]+$ ]] || return 1
+  # disallow leading/trailing dot or dash
+  [[ "$s" != .* && "$s" != -* && "$s" != *. && "$s" != *- ]] || return 1
+  return 0
+}
+
+# Core generator: prints IAM names and policy JSON to stdout
+_aws_policy_generate() {
+  local bucket_in="$1"
+  local prefix_in="$2"
+
+  # Normalize lowercase
+  bucket_in="$(printf '%s' "$bucket_in" | tr '[:upper:]' '[:lower:]')"
+  prefix_in="$(printf '%s' "$prefix_in" | tr '[:upper:]' '[:lower:]')"
+
+  # For ARNs, S3 bucket names with dots must be represented with dashes
+  local bucket_dash="${bucket_in//./-}"
+  local prefix_dash="${prefix_in//./-}"
+
+  local policy_name="POLICY_${bucket_dash}_${prefix_dash}"
+  local user_name="USER_${bucket_dash}_${prefix_dash}"
+  local key_name="KEY_${bucket_dash}_${prefix_dash}"
+
+  cat <<EOF
+POLICY  : ${policy_name}
+USER    : ${user_name}
+KEY     : ${key_name}
+
+JSON :
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "AllowListBucketPrefixOnly",
+      "Effect": "Allow",
+      "Action": [
+        "s3:ListBucket"
+      ],
+      "Resource": "arn:aws:s3:::${bucket_dash}",
+      "Condition": {
+        "StringLike": {
+          "s3:prefix": "${prefix_in}*"
+        }
+      }
+    },
+    {
+      "Sid": "AllowObjectActionsOnlyWithinPrefix",
+      "Effect": "Allow",
+      "Action": [
+        "s3:GetObject",
+        "s3:PutObject",
+        "s3:DeleteObject"
+      ],
+      "Resource": "arn:aws:s3:::${bucket_dash}/${prefix_in}/*"
+    }
+  ]
+}
+EOF
+}
+
+# Public entrypoint (called by midgard dispatcher)
+aws_policy() {
+  local bucket_in="$1"
+  local prefix_in="$2"
+
+  if [[ -z "${bucket_in:-}" || -z "${prefix_in:-}" ]]; then
+    echo "Usage: aws_policy <bucket-domain> <prefix-domain>"
+    echo "Example: aws_policy midgard.example.ca example.com"
+    return 1
+  fi
+
+  status_start "Generating AWS S3 prefix policy"
+  echo
+
+  # Input validation (verbose)
+  if ! _aws_policy_validate_domain_like "$bucket_in"; then
+    status_fail
+    echo "  Error: invalid bucket-domain: '$bucket_in'"
+    echo "         Allowed characters: a-z A-Z 0-9 . - (no leading/trailing dot/dash)"
+    return 1
+  fi
+  if ! _aws_policy_validate_domain_like "$prefix_in"; then
+    status_fail
+    echo "  Error: invalid prefix-domain: '$prefix_in'"
+    echo "         Allowed characters: a-z A-Z 0-9 . - (no leading/trailing dot/dash)"
+    return 1
+  fi
+
+  echo "  Bucket (input): ${bucket_in}"
+  echo "  Prefix (input): ${prefix_in}"
+  echo
+
+  # Generate
+  _aws_policy_generate "$bucket_in" "$prefix_in"
+  echo
+  status_ok
+}
+
+# Optional subcommand dispatcher if midgard calls: ./midgard aws-policy <args...>
+aws_policy_cmd() {
+  # Pass-through to aws_policy with two args
+  aws_policy "$@"
+}

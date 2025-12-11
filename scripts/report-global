@@ -1,0 +1,353 @@
+#!/usr/bin/env bash
+# file: ./scripts/report-global
+#------------------------------------------------------------------------------
+#
+#         .__    .___                      .___
+#   _____ |__| __| _/ _________ _______  __| _/
+#  /     \|  |/ __ | / ___\__  \\_  __ \/ __ |
+# |  Y Y  \  / /_/ |/ /_/  > __ \|  | \/ /_/ |
+# |__|_|  /__\____ |\___  (____  /__|  \____ |
+#       \/        \/_____/     \/           \/
+#
+# Generate a single global report (HTML + optional PDF) and optionally email it.
+# Must be sourced from midgard (MIDGARD_MAIN=1) after scripts/report has been sourced.
+#------------------------------------------------------------------------------
+
+if [[ "${MIDGARD_MAIN:-}" != "1" ]]; then
+  echo "This script must be sourced from the midgard launcher." >&2
+  return 1 2>/dev/null || exit 1
+fi
+
+# Reuse symbols/style from scripts/report if present; provide fallbacks
+: "${FAIL_CHAR:="❌"}"
+: "${OK_CHAR:="✅"}"
+: "${NA_CHAR:="∅"}"
+: "${WEASYPRINT_BIN:="$HOME/.local/bin/weasyprint"}"
+: "${LOGO_DATA_URI:=''}"
+
+# If _report_items / _status_to_mark exist from scripts/report, reuse; else define default items
+if [[ -z "${_report_items[*]-}" ]]; then
+  _report_items=(
+    "Remote Synchronisation|RSYNC"
+    "Remote Database Sync|SQL"
+    "ClamAV Scan|CLAMAV"
+    "Linux Malware Detect (maldet)|MALDET"
+    "Wordfence Malware Scan|WORDFENCE_MALWARE"
+    "Wordfence Vulnerabilities Scan|WORDFENCE_VULN"
+    "Wordfence Database Scan|WORDFENCE_DB"
+    "Scan Uploads for PHP|UPLOADS_PHP"
+    "Plugin Checksums|PLUGIN_CHECKSUMS"
+    "Theme Checksums|THEME_CHECKSUMS"
+    "Wordpress Checksums|WORDPRESS_CHECKSUMS"
+    "Restic Backup Sync|RESTIC"
+  )
+fi
+
+# if the helper _status_to_mark is not present, create one
+_status_to_mark_fallback() {
+  case "${1:-N/A}" in
+    OK)   printf '%s' "$OK_CHAR" ;;
+    FAIL) printf '%s' "$FAIL_CHAR" ;;
+    N/A|NA|UNKNOWN|"") printf '%s' "$NA_CHAR" ;;
+    *)    printf '%s' "$NA_CHAR" ;;
+  esac
+}
+if ! declare -F _status_to_mark >/dev/null; then
+  # create wrapper name used below
+  _status_to_mark() { _status_to_mark_fallback "$@"; }
+fi
+
+# report_generate_global <epoch>
+report_generate_global() {
+  local epoch="${1:-${EPOCH_TIMESTAMP:-}}"
+  [[ -n "$epoch" ]] || { echo "report_generate_global: missing EPOCH (or EPOCH_TIMESTAMP)"; return 1; }
+
+  local rep_dir="reports/${epoch}"
+  mkdir -p "$rep_dir"
+
+  # locate .report files
+  shopt -s nullglob
+  local rptfiles=( "${rep_dir}"/*.report )
+  shopt -u nullglob
+  if (( ${#rptfiles[@]} == 0 )); then
+    echo "report_generate_global: no reports found in ${rep_dir}"
+    return 1
+  fi
+
+  local out_html="${rep_dir}/global.html"
+  local out_pdf="${rep_dir}/global.pdf"
+  local human_date
+  human_date="$(date -d "@$epoch" '+%Y-%m-%d %H:%M:%S %Z' 2>/dev/null || date -r "$epoch" '+%Y-%m-%d %H:%M:%S %Z')"
+
+  # compute column widths: site column 35%, others share 65%
+  local total_cols=${#_report_items[@]}
+  local site_col_pct=25
+  local remaining_pct=75
+  local other_base=0 other_last=0
+  if (( total_cols > 0 )); then
+    other_base=$(( remaining_pct / total_cols ))
+    other_last=$(( remaining_pct - other_base*(total_cols-1) ))
+  fi
+
+  # Build header
+  {
+cat <<HTML
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Midgard Global Report — ${epoch}</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <style>
+    /* Use US Legal in landscape (8.5in x 14in -> landscape becomes 14in wide) */
+    @page { size: Legal landscape; margin: 1in; }
+    :root {
+      --ok: #117733;
+      --fail: #b00020;
+      --na: #666666;
+      --ink: #111111;
+      --muted: #555555;
+      --border: #e0e0e0;
+    }
+    body { font-family: system-ui, -apple-system, "Segoe UI", Roboto, Arial, sans-serif; color: var(--ink); font-size: 13px; line-height:1.35; }
+    header { display:flex; gap:12px; align-items:center; margin-bottom:18px; border-bottom:1px solid var(--border); padding-bottom:12px; }
+    header img { width:72px; height:72px; object-fit:contain; border-radius:8px; background:#fff; border:1px solid var(--border); }
+    h1 { margin:0; font-size:18px; }
+    .meta { color:var(--muted); font-size:12px; margin-top:4px; }
+    table { width:100%; border-collapse:collapse; margin-top:12px; table-layout:fixed; }
+    table th, table td { padding:6px 8px; border-bottom:1px solid var(--border); vertical-align:middle; overflow:hidden; }
+    table th { font-weight:700; font-size:12px; color:var(--muted); text-align:left; }
+    .site { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, monospace; font-size:14px; white-space:normal; word-break:break-all; }
+    .status { font-size:16px; text-align:center; white-space:nowrap; }
+    .ok { color:var(--ok); }
+    .fail { color:var(--fail); }
+    .na { color:var(--na); }
+    a.domain { color:var(--ink); text-decoration:none; font-weight:600; }
+    a.domain:hover { text-decoration:underline; }
+    .generated { margin-top:14px; color:var(--muted); font-size:12px; }
+  </style>
+</head>
+<body>
+  <header>
+    <img alt="Midgard Logo" src="${LOGO_DATA_URI}">
+    <div>
+      <h1>Midgard Global Report</h1>
+      <div class="meta">Epoch: <strong>${epoch}</strong> • Date: ${human_date} • Sites: ${#rptfiles[@]}</div>
+    </div>
+  </header>
+
+  <table>
+HTML
+
+    # print colgroup: first col site_col_pct, then per-item cols
+    printf '    <colgroup>\n' 
+    printf '      <col style="width:%s%%">\n' "$site_col_pct"
+    local i=0
+    for item in "${_report_items[@]}"; do
+      ((i++))
+      if (( i < total_cols )); then
+        printf '      <col style="width:%s%%">\n' "$other_base"
+      else
+        printf '      <col style="width:%s%%">\n' "$other_last"
+      fi
+    done
+    printf '    </colgroup>\n'
+
+    # table header row
+    printf '    <thead>\n      <tr>\n'
+    printf '        <th>Website</th>\n'
+    for item in "${_report_items[@]}"; do
+      IFS='|' read -r lab key <<<"$item"
+      # use short key label (as requested)
+      printf '        <th>%s</th>\n' "$key"
+    done
+    printf '      </tr>\n    </thead>\n    <tbody>\n'
+  } > "$out_html"
+
+  # For each .report file, build row
+  local rpt site kv k v mark cls
+  for rpt in "${rptfiles[@]}"; do
+    site="$(basename "$rpt" .report)"
+    # read file into associative array kv
+    declare -A kv=()
+    while IFS='=' read -r k v; do
+      [[ -z "${k// }" ]] && continue
+      [[ "${k:0:1}" == "#" ]] && continue
+      k="${k//[[:space:]]/}"
+      v="${v%%[[:space:]]}"
+      v="${v##[[:space:]]}"
+      kv["$k"]="$v"
+    done < "$rpt"
+
+    # start row
+    {
+      printf '      <tr>\n'
+      # domain column: show as readable link; allow wrapping
+      printf '        <td class="site"><a class="domain" href="#">%s</a></td>\n' "$site"
+    } >> "$out_html"
+
+    for item in "${_report_items[@]}"; do
+      IFS='|' read -r lab key <<<"$item"
+      val="${kv[$key]:-N/A}"
+      mark="$(_status_to_mark "$val")"
+      cls="na"
+      case "$val" in
+        OK) cls="ok" ;;
+        FAIL) cls="fail" ;;
+        *) cls="na" ;;
+      esac
+      # output only icon
+      printf '        <td class="status %s">%s</td>\n' "$cls" "$mark" >> "$out_html"
+    done
+
+    printf '      </tr>\n' >> "$out_html"
+  done
+
+  # footer & close
+  {
+cat <<HTML
+    </tbody>
+  </table>
+
+  <p class="generated">Generated by Midgard — automated site inspection.</p>
+</body>
+</html>
+HTML
+  } >> "$out_html"
+
+  # Try to make PDF if weasyprint exists. Prefer the CSS @page orientation
+  # and capture the weasyprint output into a per-epoch log for debugging.
+  if [[ -x "$WEASYPRINT_BIN" ]]; then
+    weasy_log="${rep_dir}/global-weasyprint.log"
+    if ! "$WEASYPRINT_BIN" "$out_html" "$out_pdf" >>"$weasy_log" 2>&1; then
+      echo "report_generate_global: WeasyPrint failed to create PDF (bin: ${WEASYPRINT_BIN}); see ${weasy_log}" >&2
+      # keep going — HTML was generated
+    fi
+  fi
+
+  echo "GLOBAL_REPORT: $out_html"
+  [[ -f "$out_pdf" ]] && echo "GLOBAL_PDF: $out_pdf"
+  return 0
+}
+
+# send_global_report <epoch>
+# Sends the global PDF (if present) to GLOBAL_REPORT_RECIPIENTS using same SMTP env.
+send_global_report() {
+  local epoch="${1:-${EPOCH_TIMESTAMP:-}}"
+  [[ -n "$epoch" ]] || { echo "send_global_report: missing epoch"; return 1; }
+
+  local rep_dir="reports/${epoch}"
+  local out_pdf="${rep_dir}/global.pdf"
+  local out_html="${rep_dir}/global.html"
+
+  if [[ -z "${REPORTING_ENABLE:-}" || "${REPORTING_ENABLE}" != "y" ]]; then
+    echo "send_global_report: reporting disabled (REPORTING_ENABLE != y). Skipping."
+    return 0
+  fi
+
+  local rcpts="${GLOBAL_REPORT_RECIPIENTS:-}"
+  if [[ -z "${rcpts// }" ]]; then
+    echo "send_global_report: GLOBAL_REPORT_RECIPIENTS is empty; not sending."
+    return 1
+  fi
+
+  if [[ ! -s "$out_pdf" ]]; then
+    if [[ -f "$out_html" ]]; then
+      echo "send_global_report: PDF not found; will attach HTML instead."
+    else
+      echo "send_global_report: no global PDF/HTML available to send."
+      return 1
+    fi
+  fi
+
+  local human_date
+  human_date="$(date -d "@$epoch" '+%Y-%m-%d %H:%M:%S %Z' 2>/dev/null || date -r "$epoch" '+%Y-%m-%d %H:%M:%S %Z')"
+
+  # Compose and send using python; reuse SMTP_* vars already defined in midgard.conf
+  mail_log="${rep_dir}/global-mail.log"
+  rm -f "$mail_log"
+
+  if env -i \
+      PATH="$PATH" \
+      LANG=C.UTF-8 LC_ALL=C.UTF-8 \
+      SMTP_HOST="$SMTP_HOST" \
+      SMTP_PORT="$SMTP_PORT" \
+      SMTP_USER="$SMTP_USER" \
+      SMTP_PASS="$SMTP_PASS" \
+      SMTP_FROM="$SMTP_FROM" \
+      SMTP_TLS="${SMTP_TLS:-y}" \
+      REPORTING_EMAILS="$rcpts" \
+      SITE_NAME="Midgard-Global" \
+      EPOCH_TS="$epoch" \
+      HUMAN_DATE="$human_date" \
+      PDF_PATH="$out_pdf" \
+      HTML_PATH="$out_html" \
+      SUBJECT="Midgard Global Report - ${epoch}" \
+      python3 - >>"$mail_log" 2>&1 <<'PY'
+import os, smtplib
+from email.message import EmailMessage
+
+host = os.environ["SMTP_HOST"]
+port = int(os.environ.get("SMTP_PORT","587"))
+user = os.environ.get("SMTP_USER","")
+pw   = os.environ.get("SMTP_PASS","")
+mail_from = os.environ.get("SMTP_FROM","no-reply-midgard@example.com")
+use_tls = os.environ.get("SMTP_TLS","y").lower().startswith("y")
+
+raw_rcpts = os.environ.get("REPORTING_EMAILS","")
+# accept comma and/or space separated list
+rcpts = [t for t in raw_rcpts.replace(",", " ").split() if t]
+if not rcpts:
+    raise SystemExit("No recipients")
+
+subject = os.environ.get("SUBJECT","Midgard Global Report")
+pdf = os.environ.get("PDF_PATH","")
+html = os.environ.get("HTML_PATH","")
+
+msg = EmailMessage()
+msg["From"] = mail_from
+# human-friendly header, doesn't control envelope recipients
+msg["To"] = ", ".join(rcpts)
+msg["Subject"] = subject
+
+body = f"Midgard global report\n\nEpoch: {os.environ.get('EPOCH_TS','')}\nDate: {os.environ.get('HUMAN_DATE','')}\n\nReport attached (PDF preferred)."
+msg.set_content(body)
+
+# Attach PDF if present, else attach HTML
+if pdf and os.path.isfile(pdf):
+    with open(pdf, "rb") as f:
+        data = f.read()
+    msg.add_attachment(data, maintype="application", subtype="pdf", filename=os.path.basename(pdf))
+elif html and os.path.isfile(html):
+    with open(html, "rb") as f:
+        data = f.read()
+    msg.add_attachment(data, maintype="text", subtype="html", filename=os.path.basename(html))
+else:
+    raise SystemExit("No attachment found")
+
+# send using explicit envelope recipients so all addresses are delivered
+if use_tls:
+    with smtplib.SMTP(host, port, timeout=30) as s:
+        s.ehlo()
+        s.starttls()
+        s.ehlo()
+        if user and pw:
+            s.login(user, pw)
+        s.send_message(msg, to_addrs=rcpts)
+else:
+    with smtplib.SMTP(host, port, timeout=30) as s:
+        s.ehlo()
+        if user and pw:
+            s.login(user, pw)
+        s.send_message(msg, to_addrs=rcpts)
+PY
+  then
+    echo "send_global_report: mailer executed (check ${mail_log} for SMTP output)."
+    tail -n 80 "$mail_log"
+    return 0
+  else
+    echo "send_global_report: send failed. See ${mail_log} for details."
+    tail -n 200 "$mail_log"
+    return 1
+  fi
+}

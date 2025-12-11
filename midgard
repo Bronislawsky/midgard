@@ -1,0 +1,234 @@
+#!/usr/bin/env bash
+# file : ./midgard
+set -euo pipefail
+export MIDGARD_VERSION="1.0.0"
+export MIDGARD_SCRIPT_PATH="$(dirname "$(realpath "$0")")"
+export MIDGARD_EPOCH_TIMESTAMP="$(date +%s)"
+export MIDGARD_LOG_DIR="${MIDGARD_SCRIPT_PATH}/logs"
+export MIDGARD_REPORT_DIR="${MIDGARD_SCRIPT_PATH}/reports"
+export MIDGARD_SESSION_LOG_DIR="${MIDGARD_LOG_DIR}/${MIDGARD_EPOCH_TIMESTAMP}"
+export MIDGARD_SESSION_REPORT_DIR="${MIDGARD_REPORT_DIR}/${MIDGARD_EPOCH_TIMESTAMP}"
+export MIDGARD_PLUGINS_CHECKSUMS_PATH="${MIDGARD_SCRIPT_PATH}/plugin-checksums"
+export MIDGARD_THEMES_CHECKSUMS_PATH="${MIDGARD_SCRIPT_PATH}/theme-checksums"
+export MIDGARD_WORDPRESS_CHECKSUMS_PATH="${MIDGARD_SCRIPT_PATH}/wordpress-checksums"
+#------------------------------------------------------------------------------
+cat <<'EOF'
+
+         .__    .___                      .___
+   _____ |__| __| _/ _________ _______  __| _/
+  /     \|  |/ __ | / ___\__  \\_  __ \/ __ |
+ |  Y Y  \  / /_/ |/ /_/  > __ \|  | \/ /_/ |
+ |__|_|  /__\____ |\___  (____  /__|  \____ |
+       \/        \/_____/     \/           \/
+
+EOF
+
+EPOCH_TIMESTAMP="${MIDGARD_EPOCH_TIMESTAMP}"
+
+
+echo -e " Version : ${MIDGARD_VERSION}\n"
+
+# midgard — main launcher
+#------------------------------------------------------------------------------
+
+# Guard: only code sourced from this launcher is allowed to run
+export MIDGARD_MAIN="1"
+
+# Source helpers (colors, status_* functions, etc.)
+source "$(dirname "$0")/scripts/helper"
+
+# Source crypt for encrypting / decrypting
+source "$(dirname "$0")/scripts/crypt"
+
+# Load config file
+MIDGARD_CONFIG_FILE="$(dirname "$0")/config/midgard.conf"
+status_start "Loading config file ${MIDGARD_CONFIG_FILE} ..."
+if [[ ! -f "$MIDGARD_CONFIG_FILE" ]]; then
+    status_fail
+    echo "    - config file not found"
+    exit 1
+fi
+
+# shellcheck disable=SC1090
+if ! source "$MIDGARD_CONFIG_FILE"; then
+    status_fail
+    echo "    - could not source $MIDGARD_CONFIG_FILE"
+    exit 1
+else
+    status_ok
+fi
+
+# Validate config (uses already-loaded variables, dies if invalid)
+source "$(dirname "$0")/scripts/load-config"
+
+# Check binaries + sudo -n (dies on error)
+source "$(dirname "$0")/scripts/binary-check"
+
+# Source integrity check
+source "$(dirname "$0")/scripts/integrity-check"
+integrity_check_main
+
+# Site configuration helper
+source "$(dirname "$0")/scripts/inspect-site"
+
+# Site management helpers (defines site_list/site_enable/site_disable)
+source "$(dirname "$0")/scripts/site"
+
+# Site loader (enabled list + load into assoc arrays)
+source "$(dirname "$0")/scripts/site-load"
+
+# Files retrievale functions
+source "$(dirname "$0")/scripts/pull-rsync"
+
+# Database retrievale functions
+source "$(dirname "$0")/scripts/pull-sql"
+
+# Clamav & Maldet Scans
+source "$(dirname "$0")/scripts/scan-clamav"
+source "$(dirname "$0")/scripts/scan-maldet"
+
+# Wordfence scan helpers
+source "$(dirname "$0")/scripts/scan-wordfence-malware"
+source "$(dirname "$0")/scripts/scan-wordfence-vuln"
+source "$(dirname "$0")/scripts/scan-wordfence-db"
+
+# uploads scan for PHP
+source "$(dirname "$0")/scripts/scan-uploads-php"
+
+# check plugin checkums
+source "$(dirname "$0")/scripts/plugin-checksums"
+
+# check plugin checkums
+source "$(dirname "$0")/scripts/theme-checksums"
+
+# wordpress checkums
+source "$(dirname "$0")/scripts/wordpress-checksums"
+
+# local archive
+source "$(dirname "$0")/scripts/local-archive"
+
+# Amazon S3 Restic Sync
+source "$(dirname "$0")/scripts/restic-sync"
+
+# Report Generation
+source "$(dirname "$0")/scripts/report"
+
+# Global Reporting
+source "$(dirname "$0")/scripts/report-global"
+
+# Per site mail sending helper
+source "$(dirname "$0")/scripts/sendmail-site"
+
+# fast-path subcommands that don't need global config
+case "${1-}" in
+  encstr)
+    midgard_encstr; exit 0 ;;
+  decstr)
+     midgard_decstr; exit 0 ;;
+  create-site)
+    shift
+    source "$(dirname "$0")/scripts/create-site" "$@"
+    exit 0
+    ;;
+  inspect-site)
+    shift
+    inspect_site_main "$@"
+    exit $?
+    ;;
+  aws-policy)
+    shift
+    source "$(dirname "$0")/scripts/aws-policy"
+    aws_policy_cmd "$@"
+    exit $? ;;
+  site)
+    shift
+    sub="${1-}"; shift || true
+    case "${sub:-}" in
+      list)
+        site_list; exit $? ;;
+      enable)
+        site_enable "${1-}"; exit $? ;;
+      disable)
+        site_disable "${1-}"; exit $? ;;
+      *)
+        echo "Usage: ./midgard site {list|enable <site>|disable <site>}"; exit 1 ;;
+    esac
+    ;;
+esac
+
+
+# Create a list of enabled websites
+ENABLED_SITES=()
+for f in "$(dirname "$0")/sites-enabled/"*.conf; do
+  # Skip glob if no matches
+  [[ -e "$f" ]] || continue
+  # Ensure it’s really a symlink and points to a file
+  [[ -L "$f" ]] || continue
+  # Strip path + .conf extension → just the site name
+  site="$(basename "$f" .conf)"
+  # Skip the template/example site
+  [[ "$site" == "example.com" ]] && continue
+  ENABLED_SITES+=("$site")
+done
+
+status_start "Inspect all enabled sites (skip-encrypt) ..."
+echo
+for enabled_site in "${ENABLED_SITES[@]}"; do
+  inspect_site_main "$enabled_site" "skip-encrypt" || { status_fail; echo "    - inspection failed for $enabled_site"; exit 1; }
+done;
+
+status_start "Load all enabled sites ..."
+echo
+declare -gA CONFIG_SITES=()   # map site -> array name
+for enabled_site in "${ENABLED_SITES[@]}"; do
+  # Create a legal array name (dots -> underscores)
+  #arr="SITE_${enabled_site//./_}"
+  arr="SITE_${enabled_site//[^A-Za-z0-9_]/_}"
+  declare -gA "$arr"
+  status_start "  $enabled_site"
+  site_load_into "$enabled_site" "$arr" || { echo "  Failed to load site: $enabled_site"; exit 1; }
+  status_ok
+  CONFIG_SITES["$enabled_site"]="$arr"
+done;
+
+# Start Main Backup Loop (Fetch)
+echo
+for enabled_site in "${ENABLED_SITES[@]}"; do
+  pull_rsync_main "$enabled_site" || true
+  pull_sql_main "$enabled_site" || true
+  restic_sync_site "$enabled_site" || true
+done
+
+for enabled_site in "${ENABLED_SITES[@]}"; do
+
+  scan_uploads_php_main "$enabled_site" || true
+  theme_checksums_main "$enabled_site" || true
+  plugin_checksums_main "$enabled_site" || true
+  wordpress_checksums_main "$enabled_site" || true
+  scan_clamav_main "$enabled_site" || true
+  scan_maldet_main "$enabled_site" || true
+  scan_wordfence_malware_main "$enabled_site" || true
+  scan_wordfence_vuln_main "$enabled_site" || true
+  scan_wordfence_db_main "$enabled_site" || true
+  local_archive_main "$enabled_site" || true
+
+  # Generate report Site
+  if ! report_generate_site "$enabled_site"; then
+    echo "    - fail to generate report for ${enabled_site}";
+    #exit 1
+  fi
+
+  # Send report (per-site rules)
+  if ! sendmail_site_report "$enabled_site"; then
+    echo "    - fail to send report email for ${enabled_site}";
+    #exit 1
+  fi
+
+done
+
+# Just making sure the global report gets AFTER the last site report
+sleep 30
+
+# generate and send global report
+report_generate_global "$EPOCH_TIMESTAMP" || echo "  - global report generation failed"
+send_global_report "$EPOCH_TIMESTAMP" || echo "  - global report send failed"

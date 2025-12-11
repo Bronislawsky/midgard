@@ -1,0 +1,190 @@
+#!/usr/bin/env bash
+# file : ./scripts/scan-maldet
+#------------------------------------------------------------------------------
+#
+#         .__    .___                      .___
+#   _____ |__| __| _/ _________ _______  __| _/
+#  /     \|  |/ __ | / ___\__  \\_  __ \/ __ |
+# |  Y Y  \  / /_/ |/ /_/  > __ \|  | \/ /_/ |
+# |__|_|  /__\____ |\___  (____  /__|  \____ |
+#       \/        \/_____/     \/           \/
+#
+# scan-maldet — run Linux Malware Detect against a site's local mirror
+#   - must be sourced by ./midgard (MIDGARD_MAIN=1)
+#   - logs to   ./logs/$EPOCH_TIMESTAMP/<site>.log   (NO COLOR, no site prefix)
+#   - report in ./reports/$EPOCH_TIMESTAMP/<site>.report with MALDET=OK|FAIL|SKIPPED
+#   - exit 0 on “no infection”, 1 on infection or error
+#   - optional per-site flag MALDET_IGNORE_IMAGES=y to skip JPG/JPEG via temp config
+#------------------------------------------------------------------------------
+
+[[ "${MIDGARD_MAIN:-}" == "1" ]] || {
+  echo "This script must be sourced from the midgard launcher." >&2
+  return 1 2>/dev/null || exit 1
+}
+
+scan_maldet_main() {
+  local site="$1"
+
+  mkdir -p "${MIDGARD_SESSION_LOG_DIR}" "${MIDGARD_SESSION_REPORT_DIR}"
+  local SITE_LOG_FILE="${MIDGARD_SESSION_LOG_DIR}/${site}.log"
+  local SITE_REPORT_FILE="${MIDGARD_SESSION_REPORT_DIR}/${site}.report"
+
+  if [[ -z "$site" ]]; then
+    echo "scan_maldet_main: missing site" >&2
+    echo "$(midgard_current_time) Linux Malware Detect [FAILED]" >> "$SITE_LOG_FILE"
+    echo "MALDET=FAIL" >> "$SITE_REPORT_FILE"
+    return 1
+  fi
+
+  local assoc_name="${CONFIG_SITES[$site]:-}"
+  if [[ -z "$assoc_name" ]]; then
+    echo "scan_maldet_main: site not loaded: $site" >&2
+    echo "$(midgard_current_time) Linux Malware Detect [FAILED]" >> "$SITE_LOG_FILE"
+    echo "MALDET=FAIL" >> "$SITE_REPORT_FILE"
+    return 1
+  fi
+
+  # Per-site toggles & values
+  local MALDET_ENABLE LOCAL_SYNC_PATH MALDET_IGNORE_IMAGES
+  MALDET_ENABLE="$(midgard_get_value_from_array "$assoc_name" MALDET_ENABLE)"
+  LOCAL_SYNC_PATH="$(midgard_get_value_from_array "$assoc_name" LOCAL_SYNC_PATH)"
+  MALDET_IGNORE_IMAGES="$(midgard_get_value_from_array "$assoc_name" MALDET_IGNORE_IMAGES)"
+
+  if [[ "$MALDET_ENABLE" != "y" ]]; then
+    echo -e "$(midgard_current_time) ${site} Linux Malware Detect ${c_light_blue}[${c_light_red}DISABLED${c_light_blue}]${c_reset}"
+    echo "$(midgard_current_time) Linux Malware Detect [DISABLED]" >> "$SITE_LOG_FILE"
+    echo "MALDET=SKIPPED" >> "$SITE_REPORT_FILE"
+    return 0
+  fi
+
+  # sanity
+  local errors=()
+  [[ -n "$LOCAL_SYNC_PATH" ]] || errors+=("LOCAL_SYNC_PATH")
+  [[ -d "$LOCAL_SYNC_PATH" ]] || errors+=("LOCAL_SYNC_PATH (not a dir)")
+  [[ -x "${MALDET_BIN:-}"  ]] || errors+=("MALDET_BIN")
+
+  if (( ${#errors[@]} )); then
+    for err in "${errors[@]}"; do
+      echo -e "$(midgard_current_time) ${site}   Please verify ${c_light_red}${err}${c_reset}"
+      echo    "$(midgard_current_time)    Please verify ${err}" >> "$SITE_LOG_FILE"
+    done
+    echo -e "$(midgard_current_time) ${site} Linux Malware Detect ${c_light_blue}[${c_light_red}FAILED${c_light_blue}]${c_reset}"
+    echo   "$(midgard_current_time) Linux Malware Detect [FAILED]" >> "$SITE_LOG_FILE"
+    echo "MALDET=FAIL" >> "$SITE_REPORT_FILE"
+    return 1
+  fi
+
+  # START
+  echo -e "$(midgard_current_time) ${site} Linux Malware Detect ${c_light_blue}[${c_green}STARTED${c_light_blue}]${c_reset}"
+  echo   "$(midgard_current_time) Linux Malware Detect [STARTED]" >> "$SITE_LOG_FILE"
+
+  # Optional temp ignore-file-ext in /tmp (per-site, per-run)
+  local TMP_IGNORE_EXT_FILE=""
+  if [[ "$MALDET_IGNORE_IMAGES" == "y" ]]; then
+    TMP_IGNORE_EXT_FILE="$(mktemp -p /tmp "midgard.maldet.${site}.ignore_ext.XXXXXX" 2>/dev/null || echo "")"
+    if [[ -n "$TMP_IGNORE_EXT_FILE" ]]; then
+      cat > "$TMP_IGNORE_EXT_FILE" << 'EOF'
+.jpg
+.JPG
+.jpeg
+.JPEG
+EOF
+    else
+      # If we failed to create the temp file, log it but continue without ignore
+      echo -e "$(midgard_current_time) ${site}   ${c_yellow}Warning:${c_reset} could not create temp ignore_file_ext in /tmp"
+      echo    "$(midgard_current_time)    Warning: could not create temp ignore_file_ext in /tmp" >> "$SITE_LOG_FILE"
+    fi
+  fi
+
+  # Ensure temp file is cleaned up at the end of the function
+  _scan_maldet_cleanup_tmp_ignore() {
+    if [[ -n "$TMP_IGNORE_EXT_FILE" && -f "$TMP_IGNORE_EXT_FILE" ]]; then
+      rm -f -- "$TMP_IGNORE_EXT_FILE"
+    fi
+  }
+  # shellcheck disable=SC2064
+  trap _scan_maldet_cleanup_tmp_ignore RETURN
+
+  # Build command (sudo is required for most installs)
+  local -a CMD=( sudo -n "$MALDET_BIN" )
+
+  if [[ -n "$TMP_IGNORE_EXT_FILE" && -r "$TMP_IGNORE_EXT_FILE" ]]; then
+    CMD+=( --config-option "ignore_file_ext=${TMP_IGNORE_EXT_FILE}" )
+  fi
+
+  CMD+=( -a "$LOCAL_SYNC_PATH" )
+
+  # Run and capture output (for parsing only; do NOT append to log)
+  local tmp_out rc=0
+  tmp_out="$(mktemp -t "maldet.${site}.XXXXXXXX.out")"
+
+  set -o pipefail
+  if ! "${CMD[@]}" >"$tmp_out" 2>&1; then
+    rc=$?
+  fi
+  set +o pipefail
+
+  # Extract scan ID (e.g., 251013-0518.2675260) from output if present
+  local SCAN_ID=""
+  SCAN_ID="$(grep -Eo '[0-9]{6}-[0-9]{4}\.[0-9]+' "$tmp_out" | tail -n1 || true)"
+
+  # Parse malware hits from summary
+  local HITS=""
+  HITS="$(grep -Eo 'malware hits[[:space:]]+[0-9]+' "$tmp_out" | awk '{print $3}' | tail -n1 || true)"
+
+  rm -f "$tmp_out"
+
+  # If we have a readable session report, parse concise hit lines from it.
+  # We DO NOT dump the whole report; we only emit "Found <sig> : <path>" lines.
+  local SCAN_FILE=""
+  SCAN_FILE="/usr/local/maldetect/sess/session.${SCAN_ID}"
+
+  local -a _hit_lines
+  if [[ -n "$SCAN_ID" && -r "$SCAN_FILE" ]]; then
+    # Extract hit list between "FILE HIT LIST:" and the ===== separator.
+    # Example line: "{HEX}EICAR.TEST.3 : /path/to/file"
+    mapfile -t _hit_lines < <(awk '
+      BEGIN{inhits=0}
+      /^FILE HIT LIST:/ {inhits=1; next}
+      inhits && /^=+/ {inhits=0; next}
+      inhits && NF {print $0}
+    ' "$SCAN_FILE")
+  else
+    _hit_lines=()
+  fi
+
+  # If HITS parsed and >0 OR non-empty _hit_lines, treat as infected.
+  # Prefer numeric HITS when available; otherwise count _hit_lines.
+  local hit_count_num=0
+  if [[ -n "$HITS" && "$HITS" =~ ^[0-9]+$ ]]; then
+    hit_count_num="$HITS"
+  else
+    hit_count_num="${#_hit_lines[@]}"
+  fi
+
+  if (( hit_count_num > 0 )); then
+    # Emit concise per-file lines both to terminal (colored) and to log (plain)
+    if ((${#_hit_lines[@]} > 0)); then
+      local one sig path
+      for one in "${_hit_lines[@]}"; do
+        sig="${one%% : *}"
+        path="${one#* : }"
+        # Terminal (with site + colors)
+        echo -e "$(midgard_current_time) ${site}   ${c_light_red}Found${c_reset} ${c_yellow}${sig}${c_reset} : ${c_light_red}${path}${c_reset}"
+        # Log (plain, no site)
+        echo   "$(midgard_current_time)    Found ${sig} : ${path}" >> "$SITE_LOG_FILE"
+      done
+    fi
+    # Final status (no extra fluff in log)
+    echo -e "$(midgard_current_time) ${site} Linux Malware Detect ${c_light_blue}[${c_light_red}FAILED${c_light_blue}]${c_reset}"
+    echo   "$(midgard_current_time) Linux Malware Detect [FAILED]" >> "$SITE_LOG_FILE"
+    echo "MALDET=FAIL" >> "$SITE_REPORT_FILE"
+    return 1
+  fi
+
+  # No infections detected
+  echo -e "$(midgard_current_time) ${site} Linux Malware Detect ${c_light_blue}[${c_green}SUCCESS${c_light_blue}]${c_reset}"
+  echo   "$(midgard_current_time) Linux Malware Detect [SUCCESS]" >> "$SITE_LOG_FILE"
+  echo "MALDET=OK" >> "$SITE_REPORT_FILE"
+  return 0
+}

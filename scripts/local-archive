@@ -1,0 +1,170 @@
+#!/usr/bin/env bash
+# file : ./scripts/local-archive
+#------------------------------------------------------------------------------
+#
+#         .__    .___                      .___
+#   _____ |__| __| _/ _________ _______  __| _/
+#  /     \|  |/ __ | / ___\__  \\_  __ \/ __ |
+# |  Y Y  \  / /_/ |/ /_/  > __ \|  | \/ /_/ |
+# |__|_|  /__\____ |\___  (____  /__|  \____ |
+#       \/        \/_____/     \/           \/
+#
+# local-archive — creates a local archive (.tar, uncompressed)
+#   - Produces:  ${LOCAL_ARCHIVE_PATH}/YYYY-MM-DD.<site>[--N].tar
+#   - Logs to:   ${MIDGARD_SESSION_LOG_DIR}/${site}.log
+#   - Reports:   ${MIDGARD_SESSION_REPORT_DIR}/${site}.report (LOCAL_ARCHIVE=OK|FAIL|SKIPPED)
+#   - Cleans up: archives older than LOCAL_ARCHIVE_RETENTION_DAYS (by filename date)
+#                matching YYYY-MM-DD.<site>*.tar
+#------------------------------------------------------------------------------
+
+# Safety guard — must be sourced by the Midgard launcher (provides colors, helpers, config, etc.)
+[[ "${MIDGARD_MAIN:-}" == "1" ]] || {
+  echo "This script must be sourced from the midgard launcher." >&2
+  return 1 2>/dev/null || exit 1
+}
+
+local_archive_main() {
+  local site="$1"
+
+  mkdir -p "${MIDGARD_SESSION_LOG_DIR}" "${MIDGARD_SESSION_REPORT_DIR}"
+  local SITE_LOG_FILE="${MIDGARD_SESSION_LOG_DIR}/${site}.log"
+  local SITE_REPORT_FILE="${MIDGARD_SESSION_REPORT_DIR}/${site}.report"
+
+  echo -e "$(midgard_current_time) ${site} Local Archive ${c_light_blue}[${c_green}STARTED${c_light_blue}]${c_reset}"
+  echo "$(midgard_current_time) Local Archive [STARTED]" >> "$SITE_LOG_FILE"
+
+  # Basic sanity on the site name
+  if [[ -z "$site" ]]; then
+    echo "local_archive_main: missing site" >&2
+    echo "$(midgard_current_time) Local Archive [FAILED]" >> "$SITE_LOG_FILE"
+    echo "LOCAL_ARCHIVE=FAIL" >> "$SITE_REPORT_FILE"
+    return 1
+  fi
+
+  # Lookup config association for the site
+  local assoc_name="${CONFIG_SITES[$site]:-}"
+  if [[ -z "$assoc_name" ]]; then
+    echo "local_archive_main: site not loaded: $site" >&2
+    echo "$(midgard_current_time) Local Archive [FAILED]" >> "$SITE_LOG_FILE"
+    echo "LOCAL_ARCHIVE=FAIL" >> "$SITE_REPORT_FILE"
+    return 1
+  fi
+
+  # Per-site toggles & values (from sites-data / .conf already loaded)
+  local LOCAL_ARCHIVE LOCAL_SYNC_PATH LOCAL_ARCHIVE_PATH LOCAL_ARCHIVE_RETENTION_DAYS
+  LOCAL_ARCHIVE="$(midgard_get_value_from_array "$assoc_name" LOCAL_ARCHIVE)"
+  LOCAL_SYNC_PATH="$(midgard_get_value_from_array "$assoc_name" LOCAL_SYNC_PATH)"
+  LOCAL_ARCHIVE_PATH="$(midgard_get_value_from_array "$assoc_name" LOCAL_ARCHIVE_PATH)"
+  LOCAL_ARCHIVE_RETENTION_DAYS="$(midgard_get_value_from_array "$assoc_name" LOCAL_ARCHIVE_RETENTION_DAYS)"
+
+  # Feature toggle: if disabled, record SKIPPED and exit cleanly
+  if [[ "$LOCAL_ARCHIVE" != "y" ]]; then
+    echo -e "$(midgard_current_time) ${site} Local Archive ${c_light_blue}[${c_light_red}DISABLED${c_light_blue}]${c_reset}"
+    echo "$(midgard_current_time) Local Archive [DISABLED]" >> "${SITE_LOG_FILE}"
+    echo "LOCAL_ARCHIVE=SKIPPED" >> "${SITE_REPORT_FILE}"
+    return 0
+  fi
+
+  # Ensure archive path exists (it may not yet)
+  if [[ -n "$LOCAL_ARCHIVE_PATH" && ! -d "$LOCAL_ARCHIVE_PATH" ]]; then
+    if ! mkdir -p -- "$LOCAL_ARCHIVE_PATH"; then
+      echo -e "$(midgard_current_time) ${site}   ${c_light_red}Failed to create LOCAL_ARCHIVE_PATH:${c_reset} ${LOCAL_ARCHIVE_PATH}"
+      echo    "$(midgard_current_time)    Failed to create LOCAL_ARCHIVE_PATH: ${LOCAL_ARCHIVE_PATH}" >> "$SITE_LOG_FILE"
+      echo -e "$(midgard_current_time) ${site} Local Archive ${c_light_blue}[${c_light_red}FAILED${c_light_blue}]${c_reset}"
+      echo   "$(midgard_current_time) Local Archive [FAILED]" >> "$SITE_LOG_FILE"
+      echo "LOCAL_ARCHIVE=FAIL" >> "$SITE_REPORT_FILE"
+      return 1
+    fi
+  fi
+
+  # Sanity checks on required values
+  local errors=()
+  [[ -n "$LOCAL_SYNC_PATH" ]] || errors+=("LOCAL_SYNC_PATH")
+  [[ -d "$LOCAL_SYNC_PATH" ]] || errors+=("LOCAL_SYNC_PATH (not a dir)")
+  [[ -n "$LOCAL_ARCHIVE_PATH" ]] || errors+=("LOCAL_ARCHIVE_PATH")
+  [[ -d "$LOCAL_ARCHIVE_PATH" ]] || errors+=("LOCAL_ARCHIVE_PATH (not a dir)")
+
+  # Validate retention as non-negative integer
+  if [[ -z "$LOCAL_ARCHIVE_RETENTION_DAYS" ]]; then
+    errors+=("LOCAL_ARCHIVE_RETENTION_DAYS (missing)")
+  elif [[ ! "$LOCAL_ARCHIVE_RETENTION_DAYS" =~ ^[0-9]+$ ]]; then
+    errors+=("LOCAL_ARCHIVE_RETENTION_DAYS (must be integer >= 0)")
+  fi
+
+  if (( ${#errors[@]} )); then
+    for err in "${errors[@]}"; do
+      echo -e "$(midgard_current_time) ${site}   Please verify ${c_light_red}${err}${c_reset}"
+      echo    "$(midgard_current_time)    Please verify ${err}" >> "$SITE_LOG_FILE"
+    done
+    echo -e "$(midgard_current_time) ${site} Local Archive ${c_light_blue}[${c_light_red}FAILED${c_light_blue}]${c_reset}"
+    echo   "$(midgard_current_time) Local Archive [FAILED]" >> "$SITE_LOG_FILE"
+    echo "LOCAL_ARCHIVE=FAIL" >> "$SITE_REPORT_FILE"
+    return 1
+  fi
+
+  # Build archive filename (YYYY-MM-DD.site.tar), auto-dedupe if exists
+  local today base_name out_path try i
+  today="$(date +%F)"
+  base_name="${today}.${site}"
+  out_path="${LOCAL_ARCHIVE_PATH}/${base_name}.tar"
+
+  if [[ -e "$out_path" ]]; then
+    i=1
+    while : ; do
+      try="${LOCAL_ARCHIVE_PATH}/${base_name}--${i}.tar"
+      [[ -e "$try" ]] || { out_path="$try"; break; }
+      ((i++))
+    done
+    echo -e "$(midgard_current_time) ${site}   ${c_yellow}Archive for today exists, using:${c_reset} ${c_light_blue}$(basename -- "$out_path")${c_reset}"
+    echo    "$(midgard_current_time)    Archive exists, using: $(basename -- "$out_path")" >> "$SITE_LOG_FILE"
+  fi
+
+  # Create archive directly at destination (no compression)
+  echo -e "$(midgard_current_time) ${site}   Creating archive from ${c_light_blue}${LOCAL_SYNC_PATH}${c_reset} -> ${c_light_blue}${out_path}${c_reset}"
+  echo    "$(midgard_current_time)    Creating archive ${out_path}" >> "$SITE_LOG_FILE"
+
+  if ! ( cd "$LOCAL_SYNC_PATH" && tar -c -f "$out_path" \
+        --numeric-owner --one-file-system --hard-dereference . ); then
+    echo -e "$(midgard_current_time) ${site}   ${c_light_red}tar failed${c_reset}"
+    echo    "$(midgard_current_time)    tar failed" >> "$SITE_LOG_FILE"
+    rm -f -- "$out_path"
+    echo -e "$(midgard_current_time) ${site} Local Archive ${c_light_blue}[${c_light_red}FAILED${c_light_blue}]${c_reset}"
+    echo   "$(midgard_current_time) Local Archive [FAILED]" >> "$SITE_LOG_FILE"
+    echo "LOCAL_ARCHIVE=FAIL" >> "$SITE_REPORT_FILE"
+    return 1
+  fi
+
+  chmod 0640 -- "$out_path" 2>/dev/null || true
+  echo -e "$(midgard_current_time) ${site}   ${c_green}Archive created:${c_reset} ${c_light_blue}$(basename -- "$out_path")${c_reset}"
+  echo    "$(midgard_current_time)    Archive created: $(basename -- "$out_path")" >> "$SITE_LOG_FILE"
+
+  # Cleanup: delete files named YYYY-MM-DD.site*.tar older than retention (by filename date)
+  if [[ "$LOCAL_ARCHIVE_RETENTION_DAYS" -gt 0 ]]; then
+    local cutoff_epoch
+    cutoff_epoch="$(date -d "${LOCAL_ARCHIVE_RETENTION_DAYS} days ago" +%s)"
+
+    shopt -s nullglob
+    local f base dstr depoch
+    for f in "${LOCAL_ARCHIVE_PATH}"/[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9].${site}*.tar; do
+      base="$(basename -- "$f")"
+      dstr="${base%%.*}"  # leading YYYY-MM-DD
+      if [[ "$dstr" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]]; then
+        depoch="$(date -d "$dstr" +%s 2>/dev/null || echo '')"
+        if [[ -n "$depoch" && "$depoch" -lt "$cutoff_epoch" ]]; then
+          echo -e "$(midgard_current_time) ${site}   ${c_yellow}Pruning old archive:${c_reset} ${c_light_blue}${base}${c_reset}"
+          echo    "$(midgard_current_time)    Pruning old archive: ${base}" >> "$SITE_LOG_FILE"
+          rm -f -- "$f" || {
+            echo -e "$(midgard_current_time) ${site}     ${c_light_red}Failed to delete${c_reset} ${base}"
+            echo    "$(midgard_current_time)      Failed to delete ${base}" >> "$SITE_LOG_FILE"
+          }
+        fi
+      fi
+    done
+    shopt -u nullglob
+  fi
+
+  echo -e "$(midgard_current_time) ${site} Local Archive ${c_light_blue}[${c_green}SUCCESS${c_light_blue}]${c_reset}"
+  echo   "$(midgard_current_time) Local Archive [SUCCESS]" >> "$SITE_LOG_FILE"
+  echo "LOCAL_ARCHIVE=OK" >> "$SITE_REPORT_FILE"
+  return 0
+}

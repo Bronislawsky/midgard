@@ -1,0 +1,340 @@
+#!/usr/bin/env bash
+# file : ./scripts/plugin-checksums
+#------------------------------------------------------------------------------
+#
+#         .__    .___                      .___
+#   _____ |__| __| _/ _________ _______  __| _/
+#  /     \|  |/ __ | / ___\__  \\_  __ \/ __ |
+# |  Y Y  \  / /_/ |/ /_/  > __ \|  | \/ /_/ |
+# |__|_|  /__\____ |\___  (____  /__|  \____ |
+#       \/        \/_____/     \/           \/
+#
+# plugin-checksums — prepare/check plugin checksum JSONs for a site
+#
+# - Cache base (no trailing slash):
+#       $MIDGARD_PLUGINS_CHECKSUMS_PATH/<slug>/<version>.json
+# - If cache miss, fetch:
+#       https://downloads.wordpress.org/plugin-checksums/<slug>/<version>.json
+# - Detect main plugin file like WordPress:
+#       * scan only root-level *.php in each plugin dir
+#       * look for "Plugin Name:" in first 8192 bytes (comment-safe)
+#       * extract "Version:" from the same header block
+# - If JSON unfetchable (e.g., private/commercial), mark that plugin FAIL.
+# - Append per-plugin lines to site log; write overall PLUGIN_CHECKSUMS=OK|FAIL
+#
+# NOTE: This prepares inputs. A future step can compare on-disk files vs JSON.
+#------------------------------------------------------------------------------
+
+# Safety guard: only usable when sourced by the main launcher
+# This checks if the script is being sourced from the main Midgard launcher by verifying the MIDGARD_MAIN environment variable.
+# If not, it prints an error and exits or returns (for sourcing compatibility).
+if [[ "${MIDGARD_MAIN:-}" != "1" ]]; then
+  echo "This script must be sourced from the midgard launcher." >&2
+  return 1 2>/dev/null || exit 1
+fi
+
+# Function to fetch and cache a plugin's checksum JSON file from WordPress.org.
+# It takes slug, version, and base cache directory as arguments.
+# Downloads to a temp file first for atomicity and security, then moves to cache if successful.
+_fetch_plugin_checksums_file() {
+  local slug="$1"
+  local version="$2"
+  local base_dir="$3"
+
+  # validate input
+  # Ensures all required parameters are provided; returns failure if any are empty.
+  if [[ -z "$slug" || -z "$version" || -z "$base_dir" ]]; then
+    return 1
+  fi
+
+  # Constructs the download URL and destination paths in the cache.
+  local url="https://downloads.wordpress.org/plugin-checksums/${slug}/${version}.json"
+  local dest_dir="${base_dir}/${slug}"
+  local dest_file="${dest_dir}/${version}.json"
+
+  # create a secure temp file for download
+  # Uses mktemp to create a unique temporary file in /tmp for safe downloading.
+  local tmp_file
+  tmp_file=$(mktemp "/tmp/plugin-checksum-${slug}-${version}-XXXXXX.json") || return 1
+
+  # try downloading to tmp first
+  # Attempts to download using curl (silent, follow redirects, fail on error).
+  # If successful, creates dest_dir if needed and moves the temp file atomically.
+  if curl -sfL "$url" -o "$tmp_file"; then
+    mkdir -p "$dest_dir" || { rm -f "$tmp_file"; return 1; }
+    mv "$tmp_file" "$dest_file" || { rm -f "$tmp_file"; return 1; }
+    return 0
+  else
+    # Cleans up the temp file on download failure and returns error.
+    rm -f "$tmp_file"
+    return 1
+  fi
+}
+
+# Helper to get the plugin slug from the directory path
+# Extracts the last component of the path (e.g., "classic-editor" from "/path/to/classic-editor")
+# This function derives the plugin's slug (unique identifier) from its directory name.
+# Returns empty string and failure code if the directory is invalid or doesn't exist.
+_get_plugin_slug() {
+  local plugin_dir="$1"
+  if [ -z "$plugin_dir" ] || [ ! -d "$plugin_dir" ]; then
+    echo ""
+    return 1
+  fi
+  basename "$plugin_dir"
+  return 0
+}
+
+# Function to get the plugin version from the directory
+# Takes the plugin directory path as argument and outputs the version
+# This emulates WordPress's plugin detection: scans root-level PHP files for a header comment block.
+# Looks for "Plugin Name:" to identify the main file, then extracts "Version:" from it.
+# Approximates WP's 8KB limit by checking first 100 lines; uses regex to handle various header formats.
+_get_plugin_version() {
+  local plugin_dir="$1"
+
+  if [ -z "$plugin_dir" ] || [ ! -d "$plugin_dir" ]; then
+    echo "null"
+    return 1
+  fi
+
+  local main_file=""
+  for file in "$plugin_dir"/*.php; do
+    if [ -f "$file" ] && head -n 100 "$file" | grep -iqE '^[ \t\/*#@]*Plugin Name:'; then
+      main_file="$file"
+      break
+    fi
+  done
+
+  if [ -z "$main_file" ]; then
+    echo "null"
+    return 1
+  fi
+
+  local version=$(head -n 100 "$main_file" | grep -iPo '^[ \t\/*#@]*Version:\s*\K[\d.]+')
+
+  if [ -z "$version" ]; then
+    echo "null"
+    return 1
+  else
+    echo "$version"
+    return 0
+  fi
+}
+
+# Usage: plugin_checksums_main "<site>"
+# Main entry point for processing a single site's plugins.
+# Takes the site identifier as argument; resolves config, paths, and performs checksum checks.
+plugin_checksums_main() {
+  local site="${1:-}"
+  if [[ -z "$site" ]]; then
+    echo "plugin_checksums_main: missing site" >&2
+    return 1
+  fi
+
+  # CONFIG_SITES maps site -> name of its assoc array (string)
+  # Retrieves the associative array name for the site's config from global CONFIG_SITES.
+  local assoc_name="${CONFIG_SITES[$site]:-}"
+  if [[ -z "$assoc_name" ]]; then
+    echo "plugin_checksums_main: site not loaded: $site" >&2
+    return 1
+  fi
+
+  # Prepare per-run paths
+  # Creates session log and report directories if needed, and defines site-specific file paths.
+  mkdir -p "${MIDGARD_SESSION_LOG_DIR}" "${MIDGARD_SESSION_REPORT_DIR}"
+  local SITE_LOG_FILE="${MIDGARD_SESSION_LOG_DIR}/${site}.log"
+  local SITE_REPORT_FILE="${MIDGARD_SESSION_REPORT_DIR}/${site}.report"
+
+  # Plugins name/version holder (slug:version,slug:version,...)
+  local wp_plugins_kv=""
+
+  # Per-site toggle
+  # Fetches the PLUGIN_CHECKSUMS toggle from the site's config array.
+  local PLUGIN_CHECKSUMS="$(midgard_get_value_from_array "$assoc_name" PLUGIN_CHECKSUMS)"
+
+  # Respect per-site toggle
+  # Prints a timestamped status to console for the plugin checksums process.
+  echo -en "$(midgard_current_time) ${site}"
+  echo -en "  Plugin checksums... "
+  if [[ "$PLUGIN_CHECKSUMS" != "y" ]]; then
+    # Plain log to SITE_LOG_FILE
+    # If disabled, outputs colored [DISABLED] to console, logs it plainly to file, writes SKIPPED to report, and exits successfully.
+    echo -e "${c_light_blue}[${c_light_red}DISABLED${c_light_blue}]${c_reset}"
+    echo "$(midgard_current_time)  Plugin Checksums... [DISABLED]" >> "${SITE_LOG_FILE}"
+    echo "PLUGIN_CHECKSUMS=SKIPPED" >> "${SITE_REPORT_FILE}"
+    return 0
+  fi
+
+  # If enabled, outputs colored [ENABLED] to console and logs it to file.
+  echo -e "${c_light_blue}[${c_green}ENABLED${c_light_blue}]${c_reset}"
+  echo "$(midgard_current_time)  Plugin Checksums... [ENABLED]" >> "${SITE_LOG_FILE}"
+
+  # Resolve site paths
+  # Constructs full paths to the site's plugins directory using config values.
+  local SITE_SYNC_PATH SITE_DOCUMENT_ROOT_PATH SITE_WEB_ROOT_PATH SITE_PLUGINS_PATH
+  SITE_SYNC_PATH="$(midgard_get_value_from_array "$assoc_name" LOCAL_SYNC_PATH)"
+  SITE_DOCUMENT_ROOT_PATH="$(midgard_get_value_from_array "$assoc_name" LOCAL_DOCUMENT_ROOT)"
+  SITE_WEB_ROOT_PATH="${SITE_SYNC_PATH}${SITE_DOCUMENT_ROOT_PATH}"
+  SITE_PLUGINS_PATH="${SITE_WEB_ROOT_PATH}/wp-content/plugins"
+
+  # Count failed checksum verification
+  # Initializes a flag (not a true counter) for any failures during processing.
+  local checksum_fail=0
+
+  # Loops over each subdirectory in the plugins path (assumes each is a plugin).
+  for plugin_dir in "$SITE_PLUGINS_PATH"/*; do
+    [[ -d "$plugin_dir" ]] || continue
+
+    # Retrieves slug and version using helpers; may return "null" on failure.
+    local plugin_slug=$(_get_plugin_slug "$plugin_dir");
+    local plugin_version=$(_get_plugin_version "$plugin_dir");
+
+    # If slug retrieval failed (unlikely, as it's just basename), logs error, sets fail flag, and skips.
+    if [[ "$plugin_slug" == "null" ]]; then
+        echo -e "$(midgard_current_time) ${site}    ${c_light_red}Could not determine the plugin slug${c_reset}"
+        echo "$(midgard_current_time)     Could not determine the plugin slug" >> "${SITE_LOG_FILE}"
+        checksum_fail=1
+        continue
+    fi
+
+    # If version retrieval failed (e.g., no valid header), logs error, sets fail flag, and skips.
+    if [[ "$plugin_version" == "null" ]]; then
+        echo -e "$(midgard_current_time) ${site}    ${c_light_red}Could not determine the version of ${plugin_slug}${c_reset}"
+        echo "$(midgard_current_time)     Could not determine the version of ${plugin_slug}" >> "${SITE_LOG_FILE}"
+        checksum_fail=1
+        continue
+    fi
+
+    if [[ -z "$wp_plugins_kv" ]]; then
+      wp_plugins_kv="${plugin_slug}:${plugin_version}"
+    else
+      wp_plugins_kv+=",${plugin_slug}:${plugin_version}"
+    fi
+
+    # Logs the start of checksum check for this plugin.
+    echo -e "$(midgard_current_time) ${site}    Checksum integrity check for ${c_yellow}${plugin_slug}${c_reset} version ${c_yellow}${plugin_version}${c_reset}"
+    echo "$(midgard_current_time)     Checksum integrity check for ${plugin_slug} version ${plugin_version}" >> "${SITE_LOG_FILE}"
+
+    # Constructs path to cached JSON checksum file.
+    json_checksum_file="${MIDGARD_PLUGINS_CHECKSUMS_PATH}/${plugin_slug}/${plugin_version}.json"
+    if [[ ! -f "$json_checksum_file" ]]; then
+      # If not in cache, logs miss and attempts to fetch.
+      echo -e "$(midgard_current_time) ${site}      JSON checksum file ${c_light_red}NOT${c_reset} found in cache : ${c_light_blue}${plugin_slug}/${plugin_version}.json${c_reset}"
+      echo "$(midgard_current_time)       JSON checksum file NOT found in cache : ${plugin_slug}/${plugin_version}.json" >> "${SITE_LOG_FILE}"
+
+      # Temporarily disables errexit for fetch (to handle failure gracefully).
+      set +e
+      _fetch_plugin_checksums_file "${plugin_slug}" "${plugin_version}" "${MIDGARD_PLUGINS_CHECKSUMS_PATH}"
+      local ret=$?
+      set -e
+
+      # If fetch failed (e.g., private plugin, 404), logs failure, sets flag, skips.
+      if [[ $ret -ne 0 ]]; then
+        echo -e "$(midgard_current_time) ${site}      ${c_light_red}FAILED${c_reset} to download plugin checksums file"
+        echo "$(midgard_current_time) ${site}      FAILED to download plugin checksums file" >> "${SITE_LOG_FILE}"
+        checksum_fail=1
+        continue
+      else
+        # Logs success if fetched.
+        echo -e "$(midgard_current_time) ${site}      ${c_light_green}SUCCESS${c_reset} to downloading plugin checksums file"
+        echo "$(midgard_current_time) ${site}      SUCCESS to downloading plugin checksums file" >> "${SITE_LOG_FILE}"
+      fi
+
+    fi
+
+    # Creates temp files for listing JSON keys (expected files) and local files.
+    local json_file_list=$(mktemp)
+    local local_file_list=$(mktemp)
+    # Extracts file paths from JSON using jq; sorts uniquely.
+    # If jq fails (e.g., invalid JSON), logs error, cleans partial temp, sets flag, skips.
+    if ! jq -r '.files | keys[]' "$json_checksum_file" 2>/dev/null | LC_ALL=C sort -u >"$json_file_list"; then
+      echo -e "$(midgard_current_time) ${site}      ${c_light_red}FAILED${c_reset} to parse JSON"
+      echo "$(midgard_current_time) ${site}      FAILED to parse JSON" >> "${SITE_LOG_FILE}"
+      rm -f "$json_file_list"
+      checksum_fail=1
+      continue
+    fi
+
+    # Enumerates relative paths of all files in plugin dir using find; sorts uniquely.
+    # If fails (e.g., permissions), logs error, cleans temps, sets flag, skips.
+    if ! ( cd "$plugin_dir" && find . -type f -printf '%P\n' | LC_ALL=C sort -u >"$local_file_list" ); then
+      echo -e "$(midgard_current_time) ${site}      ${c_light_red}FAILED${c_reset} to enumerate local plugin files"
+      echo "$(midgard_current_time) ${site}      FAILED to enumerate local plugin files"  >> "${SITE_LOG_FILE}"
+      rm -f "$json_file_list" "$local_file_list"
+      checksum_fail=1
+      continue
+    fi
+
+    # Always sort both lists first!
+    # Ensures lists are sorted and unique for accurate comparison with comm.
+    sort -u "$json_file_list" -o "$json_file_list"
+    sort -u "$local_file_list" -o "$local_file_list"
+
+    # Show files in JSON but not on disk
+    # Uses comm to find missing files (in JSON but not local); logs each, sets flag if any.
+    comm -23 "$json_file_list" "$local_file_list" | while read -r missing; do
+      if [ -n "$missing" ]; then
+        echo -e "$(midgard_current_time) ${site}      ${c_light_red}MISSING${c_reset} file ${c_light_blue}${missing}${c_reset}"
+        echo "$(midgard_current_time) ${site}      MISSING file ${missing}" >> "${SITE_LOG_FILE}"
+        checksum_fail=1
+      fi
+    done
+
+    # Show files on disk but not in JSON
+    # Uses comm to find extra files (in local but not JSON); logs each, sets flag if any.
+    comm -13 "$json_file_list" "$local_file_list" | while read -r extra; do
+      if [ -n "$extra" ]; then
+        echo -e "$(midgard_current_time) ${site}      ${c_light_red}FOUND${c_reset} unexpected file ${c_light_blue}${extra}${c_reset}"
+        echo "$(midgard_current_time) ${site}      FOUND unexpected file ${extra}" >> "${SITE_LOG_FILE}"
+        checksum_fail=1
+      fi
+    done
+
+    # Processes each file's hashes from JSON (file md5 sha256 format).
+    # Computes local sha256, compares; logs mismatch if different, sets flag.
+    # Sets flag silently if file missing or hashes empty (already handled by file lists).
+    while IFS=$'\t' read -r file md5 sha256; do
+      local local_file="${plugin_dir}/${file}"
+      if [[ -f "$local_file" ]]; then
+        local local_sha256=$(sha256sum "$local_file" | awk '{print $1}')
+        if [[ -n "$local_sha256" && -n "$sha256" ]]; then
+          if [[ "$local_sha256" != "$sha256" ]]; then
+            echo -e "$(midgard_current_time) ${site}      ${c_light_red}CHECKSUM MISMATCH${c_reset} for ${c_light_blue}${file}${c_reset}"
+            echo "$(midgard_current_time) ${site}      CHECKSUM MISMATCH for ${file}" >> "${SITE_LOG_FILE}"
+            checksum_fail=1
+          fi
+        else
+          # Silently fail as we already enumerate missing files
+          checksum_fail=1
+        fi
+      else
+        # Silently fail as we already enumerate missing files
+        checksum_fail=1
+      fi
+    done < <(jq -r '.files | to_entries[] | [.key, .value.md5, .value.sha256] | join("\t")' "$json_checksum_file")
+
+  done
+
+  # Outputs final status to console and log file based on whether any failures occurred.
+  echo -en "$(midgard_current_time) ${site}"
+  echo -en "  Plugin checksums... "
+  echo -n "$(midgard_current_time)   Plugin checksums... " >> "${SITE_LOG_FILE}"
+
+  if [[ -n "$wp_plugins_kv" ]]; then
+    echo "WP_PLUGINS=${wp_plugins_kv}" >> "${SITE_REPORT_FILE}"
+  fi
+
+  if [[ ${checksum_fail:-0} -eq 0 ]]; then
+    echo -e "${c_light_blue}[${c_green}SUCCESS${c_light_blue}]${c_reset}"
+    echo "[SUCCESS]" >> "${SITE_LOG_FILE}"
+    echo "PLUGIN_CHECKSUMS=OK" >> "${SITE_REPORT_FILE}"
+    return 0
+  fi
+
+  echo -e "${c_light_blue}[${c_light_red}FAILED${c_light_blue}]${c_reset}"
+  echo "[FAILED]" >> "${SITE_LOG_FILE}"
+  echo "PLUGIN_CHECKSUMS=FAIL" >> "${SITE_REPORT_FILE}"
+  return 1
+
+}

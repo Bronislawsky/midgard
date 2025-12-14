@@ -76,7 +76,7 @@ scan_clamav_main() {
   local tmp_out rc
   tmp_out="$(mktemp -t "clamav.${site}.XXXXXXXX.out")"
 
-  sudo -n "$CLAMDSCAN_BIN" --allmatch --no-summary --multiscan --fdpass "$LOCAL_SYNC_PATH" >"$tmp_out" 2>&1
+  sudo -n "$CLAMDSCAN_BIN" --allmatch --no-summary --multiscan --stream "$LOCAL_SYNC_PATH" >"$tmp_out" 2>&1
   rc=$?
 
   if (( rc != 0 )); then

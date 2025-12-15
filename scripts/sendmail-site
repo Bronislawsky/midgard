@@ -47,8 +47,9 @@ sendmail_site_report() {
   REPORTING_ENABLE="$(_get "$arr" REPORTING_ENABLE)"
   REPORTING_EMAILS="$(_get "$arr" REPORTING_EMAILS)"
 
-  local log_dir="logs/${EPOCH_TIMESTAMP}"
-  local rep_dir="reports/${EPOCH_TIMESTAMP}"
+  local log_dir="${MIDGARD_ROOT_DIR}/logs/${EPOCH_TIMESTAMP}"
+  local rep_dir="${MIDGARD_ROOT_DIR}/reports/${EPOCH_TIMESTAMP}"
+
   local rep_file="${rep_dir}/${site}.report"
   local site_log="${log_dir}/${site}.log"
   local site_pdf="${rep_dir}/${site}.pdf"

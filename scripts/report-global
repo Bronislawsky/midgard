@@ -62,7 +62,9 @@ report_generate_global() {
   local epoch="${1:-${EPOCH_TIMESTAMP:-}}"
   [[ -n "$epoch" ]] || { echo "report_generate_global: missing EPOCH (or EPOCH_TIMESTAMP)"; return 1; }
 
-  local rep_dir="reports/${epoch}"
+
+  local log_dir="${MIDGARD_ROOT_DIR}/logs/${EPOCH_TIMESTAMP}"
+  local rep_dir="${MIDGARD_ROOT_DIR}/reports/${EPOCH_TIMESTAMP}"
   mkdir -p "$rep_dir"
 
   # locate .report files

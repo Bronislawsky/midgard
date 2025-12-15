@@ -11,6 +11,7 @@ export MIDGARD_SESSION_REPORT_DIR="${MIDGARD_REPORT_DIR}/${MIDGARD_EPOCH_TIMESTA
 export MIDGARD_PLUGINS_CHECKSUMS_PATH="${MIDGARD_SCRIPT_PATH}/plugin-checksums"
 export MIDGARD_THEMES_CHECKSUMS_PATH="${MIDGARD_SCRIPT_PATH}/theme-checksums"
 export MIDGARD_WORDPRESS_CHECKSUMS_PATH="${MIDGARD_SCRIPT_PATH}/wordpress-checksums"
+export MIDGARD_ROOT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 #------------------------------------------------------------------------------
 cat <<'EOF'
 

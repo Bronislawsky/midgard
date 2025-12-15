@@ -196,7 +196,7 @@ echo
 for enabled_site in "${ENABLED_SITES[@]}"; do
   pull_rsync_main "$enabled_site" || true
   pull_sql_main "$enabled_site" || true
-  restic_sync_site "$enabled_site" || true
+  restic_sync_main "$enabled_site" || true
 done
 
 for enabled_site in "${ENABLED_SITES[@]}"; do

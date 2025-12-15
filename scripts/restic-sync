@@ -1,30 +1,25 @@
 #!/usr/bin/env bash
-# file : ./scripts/restc-sync
+# file : ./scripts/restic-sync
 #------------------------------------------------------------------------------
 #
 #         .__    .___                      .___
 #   _____ |__| __| _/ _________ _______  __| _/
 #  /     \|  |/ __ | / ___\__  \\_  __ \/ __ |
-# |  Y Y  \  / /_/ |/ /_/  > __ \|  | \/ /_/ |
+# |  Y Y  \  / /_/ | /_/  > __ \|  | \/ /_/ |
 # |__|_|  /__\____ |\___  (____  /__|  \____ |
 #       \/        \/_____/     \/           \/
 #
 # restic-sync — back up LOCAL_SYNC_PATH to S3 with retention
-#
+#   - requires MIDGARD_MAIN=1 + global config loaded (RESTIC_BIN, retries)
+#   - expects CONFIG_SITES map already populated
+#   - writes RESTIC=OK|FAIL|N/A into MIDGARD_SESSION_REPORT_DIR/<site>.report
 #------------------------------------------------------------------------------
-
-# Must be sourced by the midgard launcher
-[[ "${MIDGARD_MAIN:-}" == "1" ]] || { echo "Must be sourced by midgard"; return 1 2>/dev/null || exit 1; }
-
-# --- helpers supplied by scripts/helper: info, status_start, status_ok, status_fail ---
-
-# _get <assoc_array_name> <key>
-_get() {
-  local __arr_name="$1" __key="$2"
-  eval "printf '%s' \"\${$__arr_name[\"$__key\"]-}\""
+[[ "${MIDGARD_MAIN:-}" == "1" ]] || {
+  echo "This script must be sourced from the midgard launcher." >&2
+  return 1 2>/dev/null || exit 1
 }
 
-__build_repo_url() {
+__restic_build_repo_url() {
   local region="$1" bucket="$2" prefix="$3"
   local host="s3.amazonaws.com"
   if [[ -n "$region" && "$region" != "us-east-1" ]]; then
@@ -33,111 +28,93 @@ __build_repo_url() {
   printf 's3:%s/%s/%s' "$host" "$bucket" "$prefix"
 }
 
-__retry() { # __retry <label> <cmd...>
-  local label="$1"; shift
-  local tries="${DEFAULT_RETRIES:-3}"
-  local backoff="${DEFAULT_RETRY_BACKOFF_SECS:-5}"
-  local n=1 rc=0
-  while :; do
-    "$@"; rc=$?
-    (( rc == 0 )) && return 0
-    if (( n >= tries )); then
-      info "[restic] ${label} failed after ${n} attempt(s) (rc=$rc)"
-      return "$rc"
-    fi
-    info "[restic] ${label} failed (rc=$rc); retrying in ${backoff}s… [${n}/${tries}]"
-    sleep "$backoff"
-    ((n++))
-  done
-}
+restic_sync_main() {
+  local site="$1"
 
-# restic_sync_site <site>
-restic_sync_site() {
-  local site="${1:-}"
-  status_start "Restic sync for ${site} …"
-  echo
+  mkdir -p "${MIDGARD_SESSION_LOG_DIR}" "${MIDGARD_SESSION_REPORT_DIR}"
+  local SITE_LOG_FILE suggesting SITE_REPORT_FILE
+  SITE_LOG_FILE="${MIDGARD_SESSION_LOG_DIR}/${site}.log"
+  SITE_REPORT_FILE="${MIDGARD_SESSION_REPORT_DIR}/${site}.report"
 
-  # reset any leaked env from previous sites
-  unset RESTIC_REPOSITORY RESTIC_PASSWORD RESTIC_PASSWORD_FILE
-  unset AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_DEFAULT_REGION
+  echo -e "$(midgard_current_time) ${site} Restic Backup Sync ${c_light_blue}[${c_green}STARTED${c_light_blue}]${c_reset}"
+  echo "$(midgard_current_time) Restic Backup Sync [STARTED]" >> "$SITE_LOG_FILE"
 
-  [[ -n "$site" ]] || { info "[restic] missing site argument"; [[ -n "${rep_site:-}" ]] && echo "RESTIC=FAIL" >>"$rep_site"; status_fail; return 2; }
-
-  # resolve per-site array
-  local arr="${CONFIG_SITES[$site]:-}"
-  [[ -n "$arr" ]] || { info "[restic] site not loaded: $site"; [[ -n "${rep_site:-}" ]] && echo "RESTIC=FAIL" >>"$rep_site"; status_fail; return 2; }
-
-  # --- log/report files (respect rep_log/rep_site if provided) ---
-  local log_dir rep_dir site_log site_rep
-  site_log="${rep_log:-logs/${EPOCH_TIMESTAMP}/${site}.log}"
-  site_rep="${rep_site:-reports/${EPOCH_TIMESTAMP}/${site}.report}"
-  if [[ -z "${rep_log:-}" || -z "${rep_site:-}" ]]; then
-    log_dir="${site_log%/*}"
-    rep_dir="${site_rep%/*}"
-    mkdir -p "$log_dir" "$rep_dir"
+  if [[ -z "$site" ]]; then
+    echo "restic_sync_main: missing site" >&2
+    echo "$(midgard_current_time) Restic Backup Sync [FAILED]" >> "$SITE_LOG_FILE"
+    echo "RESTIC=FAIL" >> "$SITE_REPORT_FILE"
+    return 1
   fi
 
-  # --- inputs from site/global context ---
+  local assoc_name="${CONFIG_SITES[$site]:-}"
+  if [[ -z "$assoc_name" ]]; then
+    echo "restic_sync_main: site not loaded: $site" >&2
+    echo "$(midgard_current_time) Restic Backup Sync [FAILED]" >> "$SITE_LOG_FILE"
+    echo "RESTIC=FAIL" >> "$SITE_REPORT_FILE"
+    return 1
+  fi
+
+  # fetch fields
   local LOCAL_SYNC_PATH RESTIC_RETENTION_DAYS
   local AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_S3_BUCKET AWS_DEFAULT_REGION AWS_S3_PATH
-  LOCAL_SYNC_PATH="$(_get "$arr" LOCAL_SYNC_PATH)"
-  RESTIC_RETENTION_DAYS="$(_get "$arr" RESTIC_RETENTION_DAYS)"
-  AWS_ACCESS_KEY_ID="$(_get "$arr" AWS_ACCESS_KEY_ID)"
-  AWS_SECRET_ACCESS_KEY="$(_get "$arr" AWS_SECRET_ACCESS_KEY)"
-  AWS_S3_BUCKET="$(_get "$arr" AWS_S3_BUCKET)"
-  AWS_DEFAULT_REGION="$(_get "$arr" AWS_DEFAULT_REGION)"
-  AWS_S3_PATH="$(_get "$arr" AWS_S3_PATH)"
 
-  # RESTIC_BIN comes from global config (not per-site)
-  if [[ -z "${RESTIC_BIN:-}" || ! -x "${RESTIC_BIN:-/nonexistent}" ]]; then
-    info "[restic] RESTIC_BIN not executable: ${RESTIC_BIN:-<unset>}" | tee -a "$site_log" >/dev/null
-    echo "RESTIC=FAIL" >>"$site_rep"
-    status_fail
+  LOCAL_SYNC_PATH="$(midgard_get_value_from_array "$assoc_name" LOCAL_SYNC_PATH)"
+  RESTIC_RETENTION_DAYS="$(midgard_get_value_from_array "$assoc_name" RESTIC_RETENTION_DAYS)"
+  AWS_ACCESS_KEY_ID="$(midgard_get_value_from_array "$assoc_name" AWS_ACCESS_KEY_ID)"
+  AWS_SECRET_ACCESS_KEY="$(midgard_get_value_from_array "$assoc_name" AWS_SECRET_ACCESS_KEY)"
+  AWS_S3_BUCKET="$(midgard_get_value_from_array "$assoc_name" AWS_S3_BUCKET)"
+  AWS_DEFAULT_REGION="$(midgard_get_value_from_array "$assoc_name" AWS_DEFAULT_REGION)"
+  AWS_S3_PATH="$(midgard_get_value_from_array "$assoc_name" AWS_S3_PATH)"
+
+  # sanity
+  local errors=()
+  [[ -x "${RESTIC_BIN:-}" ]] || errors+=("RESTIC_BIN")
+  [[ -n "$LOCAL_SYNC_PATH" ]] || errors+=("LOCAL_SYNC_PATH")
+  [[ -n "$AWS_ACCESS_KEY_ID" ]] || errors+=("AWS_ACCESS_KEY_ID")
+  [[ -n "$AWS_SECRET_ACCESS_KEY" ]] || errors+=("AWS_SECRET_ACCESS_KEY")
+  [[ -n "$AWS_S3_BUCKET" ]] || errors+=("AWS_S3_BUCKET")
+  [[ -n "$AWS_S3_PATH" ]] || errors+=("AWS_S3_PATH")
+
+  if (( ${#errors[@]} )); then
+    for err in "${errors[@]}"; do
+      echo -e "$(midgard_current_time) ${site}   Please verify ${c_light_red}${err}${c_reset}"
+      echo "$(midgard_current_time) ${site}   Please verify ${err}" >> "$SITE_LOG_FILE"
+    done
+    echo -e "$(midgard_current_time) ${site} Restic Backup Sync ${c_light_blue}[${c_light_red}FAILED${c_light_blue}]${c_reset}"
+    echo "$(midgard_current_time) Restic Backup Sync [FAILED]" >> "$SITE_LOG_FILE"
+    echo "RESTIC=FAIL" >> "$SITE_REPORT_FILE"
     return 1
   fi
 
-  # required AWS bits
-  local v
-  for v in AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_S3_BUCKET AWS_S3_PATH; do
-    if [[ -z "${!v:-}" ]]; then
-      info "[restic] Missing required AWS variable: $v" | tee -a "$site_log" >/dev/null
-      echo "RESTIC=FAIL" >>"$site_rep"
-      status_fail
-      return 1
-    fi
-  done
-
-  # local path checks
-  if [[ -z "$LOCAL_SYNC_PATH" ]]; then
-    info "[restic] LOCAL_SYNC_PATH is empty" | tee -a "$site_log" >/dev/null
-    echo "RESTIC=FAIL" >>"$site_rep"
-    status_fail
-    return 1
-  fi
+  # path checks (keep semantics aligned with report renderer: OK/FAIL/N/A)
   if [[ ! -d "$LOCAL_SYNC_PATH" ]]; then
-    info "[restic] LOCAL_SYNC_PATH not found: ${LOCAL_SYNC_PATH} — skipping" | tee -a "$site_log" >/dev/null
-    echo "RESTIC=SKIPPED" >>"$site_rep"
-    status_ok
+    echo -e "$(midgard_current_time) ${site}   LOCAL_SYNC_PATH missing -> mark N/A: ${c_yellow}${LOCAL_SYNC_PATH}${c_reset}"
+    echo "$(midgard_current_time) ${site}   LOCAL_SYNC_PATH missing -> mark N/A: ${LOCAL_SYNC_PATH}" >> "$SITE_LOG_FILE"
+    echo -e "$(midgard_current_time) ${site} Restic Backup Sync ${c_light_blue}[${c_yellow}N/A${c_light_blue}]${c_reset}"
+    echo "$(midgard_current_time) Restic Backup Sync [N/A]" >> "$SITE_LOG_FILE"
+    echo "RESTIC=N/A" >> "$SITE_REPORT_FILE"
     return 0
   fi
 
-  # retention
+  # retention days
   local keep_days="${RESTIC_RETENTION_DAYS:-30}"
   if ! [[ "$keep_days" =~ ^[0-9]+$ ]]; then
-    info "[restic] RESTIC_RETENTION_DAYS not numeric ('${keep_days}'); defaulting to 30" | tee -a "$site_log" >/dev/null
+    echo "$(midgard_current_time) ${site}   RESTIC_RETENTION_DAYS not numeric ('$keep_days'); defaulting to 30" >> "$SITE_LOG_FILE"
     keep_days="30"
   fi
 
   # repo url
   local repo
-  if ! repo="$(__build_repo_url "${AWS_DEFAULT_REGION:-}" "$AWS_S3_BUCKET" "$AWS_S3_PATH")"; then
-    info "[restic] Unable to construct repository URL" | tee -a "$site_log" >/dev/null
-    echo "RESTIC=FAIL" >>"$site_rep"
-    status_fail
+  repo="$(__restic_build_repo_url "${AWS_DEFAULT_REGION:-}" "$AWS_S3_BUCKET" "$AWS_S3_PATH")"
+  if [[ -z "$repo" ]]; then
+    echo "$(midgard_current_time) ${site}   Unable to construct repository URL" >> "$SITE_LOG_FILE"
+    echo -e "$(midgard_current_time) ${site} Restic Backup Sync ${c_light_blue}[${c_light_red}FAILED${c_light_blue}]${c_reset}"
+    echo "$(midgard_current_time) Restic Backup Sync [FAILED]" >> "$SITE_LOG_FILE"
+    echo "RESTIC=FAIL" >> "$SITE_REPORT_FILE"
     return 1
   fi
 
-  # password file
+  # password file logic (same as your old script)
   local script_dir root_dir data_dir restic_password_file
   script_dir="$(cd -- "$(dirname "${BASH_SOURCE[0]}")" &>/dev/null; pwd -P)"
   root_dir="$(cd -- "${script_dir}/.." &>/dev/null; pwd -P)"
@@ -145,55 +122,82 @@ restic_sync_site() {
   restic_password_file="${RESTIC_PASSWORD_FILE:-${data_dir}/${site}/restic.pass}"
 
   if [[ -z "${RESTIC_PASSWORD:-}" && ( -z "${restic_password_file:-}" || ! -r "$restic_password_file" ) ]]; then
-    info "[restic] Missing RESTIC_PASSWORD or readable ${data_dir}/${site}/restic.pass" | tee -a "$site_log" >/dev/null
-    echo "RESTIC=FAIL" >>"$site_rep"
-    status_fail
+    echo "$(midgard_current_time) ${site}   Missing RESTIC_PASSWORD or readable ${data_dir}/${site}/restic.pass" >> "$SITE_LOG_FILE"
+    echo -e "$(midgard_current_time) ${site} Restic Backup Sync ${c_light_blue}[${c_light_red}FAILED${c_light_blue}]${c_reset}"
+    echo "$(midgard_current_time) Restic Backup Sync [FAILED]" >> "$SITE_LOG_FILE"
+    echo "RESTIC=FAIL" >> "$SITE_REPORT_FILE"
     return 1
   fi
 
-  # export env for restic
+  # reset any leaked env + export for restic
+  unset RESTIC_REPOSITORY RESTIC_PASSWORD_FILE
+  unset AWS_DEFAULT_REGION
   export AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY
   [[ -n "${AWS_DEFAULT_REGION:-}" ]] && export AWS_DEFAULT_REGION
   export RESTIC_REPOSITORY="$repo"
   [[ -z "${RESTIC_PASSWORD:-}" ]] && export RESTIC_PASSWORD_FILE="$restic_password_file"
 
-  info "[restic] Repository: $RESTIC_REPOSITORY" | tee -a "$site_log" >/dev/null
-  info "[restic] Backing up: $LOCAL_SYNC_PATH" | tee -a "$site_log" >/dev/null
-  info "[restic] Retention: keep-within ${keep_days}d" | tee -a "$site_log" >/dev/null
+  echo "$(midgard_current_time) ${site}   Repository: $RESTIC_REPOSITORY" >> "$SITE_LOG_FILE"
+  echo "$(midgard_current_time) ${site}   Backing up: $LOCAL_SYNC_PATH" >> "$SITE_LOG_FILE"
+  echo "$(midgard_current_time) ${site}   Retention: keep-within ${keep_days}d" >> "$SITE_LOG_FILE"
 
-  # probe/init
-  if ! __retry "restic snapshots" "$RESTIC_BIN" snapshots >>"$site_log" 2>&1; then
-    info "[restic] Repository not initialized; initializing…" | tee -a "$site_log" >/dev/null
-    if ! __retry "restic init" "$RESTIC_BIN" init >>"$site_log" 2>&1; then
-      info "[restic] restic init failed" | tee -a "$site_log" >/dev/null
-      echo "RESTIC=FAIL" >>"$site_rep"
-      status_fail
+  local tries="${DEFAULT_RETRIES:-3}"
+  local backoff="${DEFAULT_RETRY_BACKOFF_SECS:-5}"
+  local n rc=0
+
+  # probe/init (snapshots; init if needed)
+  rc=0
+  for ((n=1; n<=tries; n++)); do
+    "${RESTIC_BIN}" snapshots >> "$SITE_LOG_FILE" 2>&1 && { rc=0; break; } || rc=$?
+    (( n < tries )) && { echo "retry snapshots $n/${tries} in ${backoff}s (rc=$rc)" >> "$SITE_LOG_FILE"; sleep "$backoff"; }
+  done
+  if (( rc != 0 )); then
+    echo "$(midgard_current_time) ${site}   Repository not initialized; running restic init" >> "$SITE_LOG_FILE"
+    rc=0
+    for ((n=1; n<=tries; n++)); do
+      "${RESTIC_BIN}" init >> "$SITE_LOG_FILE" 2>&1 && { rc=0; break; } || rc=$?
+      (( n < tries )) && { echo "retry init $n/${tries} in ${backoff}s (rc=$rc)" >> "$SITE_LOG_FILE"; sleep "$backoff"; }
+    done
+    if (( rc != 0 )); then
+      echo -e "$(midgard_current_time) ${site} Restic Backup Sync ${c_light_blue}[${c_light_red}FAILED${c_light_blue}]${c_reset}"
+      echo "$(midgard_current_time) Restic Backup Sync [FAILED]" >> "$SITE_LOG_FILE"
+      echo "RESTIC=FAIL" >> "$SITE_REPORT_FILE"
       return 1
     fi
   fi
 
   # backup
-  if ! __retry "restic backup" "$RESTIC_BIN" backup \
-        --one-file-system \
-        --tag "midgard" --tag "$site" \
-        "$LOCAL_SYNC_PATH" >>"$site_log" 2>&1; then
-    info "[restic] restic backup failed" | tee -a "$site_log" >/dev/null
-    echo "RESTIC=FAIL" >>"$site_rep"
-    status_fail
+  rc=0
+  for ((n=1; n<=tries; n++)); do
+    "${RESTIC_BIN}" backup \
+      --one-file-system \
+      --host "${RUN_AS_HOST}" \
+      --tag "midgard" --tag "$site" \
+      "$LOCAL_SYNC_PATH" >> "$SITE_LOG_FILE" 2>&1 && { rc=0; break; } || rc=$?
+    (( n < tries )) && { echo "retry backup $n/${tries} in ${backoff}s (rc=$rc)" >> "$SITE_LOG_FILE"; sleep "$backoff"; }
+  done
+  if (( rc != 0 )); then
+    echo -e "$(midgard_current_time) ${site} Restic Backup Sync ${c_light_blue}[${c_light_red}FAILED${c_light_blue}]${c_reset}"
+    echo "$(midgard_current_time) Restic Backup Sync [FAILED]" >> "$SITE_LOG_FILE"
+    echo "RESTIC=FAIL" >> "$SITE_REPORT_FILE"
     return 1
   fi
 
-  # retention
-  if ! __retry "restic forget/prune" "$RESTIC_BIN" forget \
-        --keep-within "${keep_days}d" --prune >>"$site_log" 2>&1; then
-    info "[restic] restic retention (forget/prune) failed" | tee -a "$site_log" >/dev/null
-    echo "RESTIC=FAIL" >>"$site_rep"
-    status_fail
+  # retention prune
+  rc=0
+  for ((n=1; n<=tries; n++)); do
+    "${RESTIC_BIN}" forget --keep-within "${keep_days}d" --prune >> "$SITE_LOG_FILE" 2>&1 && { rc=0; break; } || rc=$?
+    (( n < tries )) && { echo "retry prune $n/${tries} in ${backoff}s (rc=$rc)" >> "$SITE_LOG_FILE"; sleep "$backoff"; }
+  done
+  if (( rc != 0 )); then
+    echo -e "$(midgard_current_time) ${site} Restic Backup Sync ${c_light_blue}[${c_light_red}FAILED${c_light_blue}]${c_reset}"
+    echo "$(midgard_current_time) Restic Backup Sync [FAILED]" >> "$SITE_LOG_FILE"
+    echo "RESTIC=FAIL" >> "$SITE_REPORT_FILE"
     return 1
   fi
 
-  info "[restic] Backup + retention completed successfully" | tee -a "$site_log" >/dev/null
-  echo "RESTIC=OK" >>"$site_rep"
-  status_ok
+  echo -e "$(midgard_current_time) ${site} Restic Backup Sync ${c_light_blue}[${c_green}SUCCESS${c_light_blue}]${c_reset}"
+  echo "$(midgard_current_time) Restic Backup Sync [SUCCESS]" >> "$SITE_LOG_FILE"
+  echo "RESTIC=OK" >> "$SITE_REPORT_FILE"
   return 0
 }

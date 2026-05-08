@@ -33,42 +33,56 @@ if [[ "${MIDGARD_MAIN:-}" != "1" ]]; then
   return 1 2>/dev/null || exit 1
 fi
 
-# Function to fetch and cache a plugin's checksum JSON file from WordPress.org.
-# It takes slug, version, and base cache directory as arguments.
-# Downloads to a temp file first for atomicity and security, then moves to cache if successful.
 _fetch_plugin_checksums_file() {
   local slug="$1"
   local version="$2"
   local base_dir="$3"
 
-  # validate input
-  # Ensures all required parameters are provided; returns failure if any are empty.
   if [[ -z "$slug" || -z "$version" || -z "$base_dir" ]]; then
     return 1
   fi
 
-  # Constructs the download URL and destination paths in the cache.
-  local url="https://downloads.wordpress.org/plugin-checksums/${slug}/${version}.json"
+  local official_url="https://downloads.wordpress.org/plugin-checksums/${slug}/${version}.json"
+  local alt_url="https://podeel.com/checksums/${slug}/${version}.json"
+
   local dest_dir="${base_dir}/${slug}"
   local dest_file="${dest_dir}/${version}.json"
 
-  # create a secure temp file for download
-  # Uses mktemp to create a unique temporary file in /tmp for safe downloading.
   local tmp_file
   tmp_file=$(mktemp "/tmp/plugin-checksum-${slug}-${version}-XXXXXX.json") || return 1
 
-  # try downloading to tmp first
-  # Attempts to download using curl (silent, follow redirects, fail on error).
-  # If successful, creates dest_dir if needed and moves the temp file atomically.
-  if curl -sfL "$url" -o "$tmp_file"; then
-    mkdir -p "$dest_dir" || { rm -f "$tmp_file"; return 1; }
-    mv "$tmp_file" "$dest_file" || { rm -f "$tmp_file"; return 1; }
-    return 0
+  # Used by caller for logging.
+  PLUGIN_CHECKSUMS_LAST_SOURCE=""
+
+  # 1. Try official WordPress.org checksum endpoint first.
+  if curl -sfL "$official_url" -o "$tmp_file"; then
+    PLUGIN_CHECKSUMS_LAST_SOURCE="wordpress.org"
   else
-    # Cleans up the temp file on download failure and returns error.
+    rm -f "$tmp_file"
+
+    tmp_file=$(mktemp "/tmp/plugin-checksum-${slug}-${version}-XXXXXX.json") || return 1
+
+    # 2. Try private/alternate checksum endpoint.
+    if curl -sfL "$alt_url" -o "$tmp_file"; then
+      PLUGIN_CHECKSUMS_LAST_SOURCE="podeel.com"
+    else
+      rm -f "$tmp_file"
+      PLUGIN_CHECKSUMS_LAST_SOURCE=""
+      return 1
+    fi
+  fi
+
+  mkdir -p "$dest_dir" || {
     rm -f "$tmp_file"
     return 1
-  fi
+  }
+
+  mv "$tmp_file" "$dest_file" || {
+    rm -f "$tmp_file"
+    return 1
+  }
+
+  return 0
 }
 
 # Helper to get the plugin slug from the directory path
@@ -237,8 +251,8 @@ plugin_checksums_main() {
         continue
       else
         # Logs success if fetched.
-        echo -e "$(midgard_current_time) ${site}      ${c_light_green}SUCCESS${c_reset} to downloading plugin checksums file"
-        echo "$(midgard_current_time) ${site}      SUCCESS to downloading plugin checksums file" >> "${SITE_LOG_FILE}"
+        echo -e "$(midgard_current_time) ${site}      ${c_light_green}SUCCESS${c_reset} downloading plugin checksums file from ${c_light_blue}${PLUGIN_CHECKSUMS_LAST_SOURCE:-unknown}${c_reset}"
+        echo "$(midgard_current_time) ${site}      SUCCESS downloading plugin checksums file from ${PLUGIN_CHECKSUMS_LAST_SOURCE:-unknown}" >> "${SITE_LOG_FILE}"
       fi
 
     fi

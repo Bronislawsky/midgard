@@ -18,9 +18,9 @@
 # - If JSON missing (e.g., unknown version), mark as FAIL.
 # - Append lines to site log; write overall WORDPRESS_CHECKSUMS=OK|FAIL
 #
-# NOTE: This checks core integrity. Ignores only wp-content/uploads for extras to follow user directive,
-# but keeps standard ignores for plugins/themes/wp-config/etc. to avoid false positives on expected files.
-# Filters out plugins/themes paths from JSON to avoid flagging them as missing/mismatched (scanned separately).
+# NOTE: This checks core integrity. Prunes uploads/plugins/themes and configured ignore paths
+# from the local "extra file" walk before sorting, while still checking expected core files.
+# Filters out plugins/themes/languages paths from JSON to avoid flagging them as missing/mismatched.
 # Scans wp-content/languages/*.php for malicious code; ignores only if clean.
 #------------------------------------------------------------------------------
 
@@ -82,45 +82,141 @@ _is_suspicious() {
   return 1  # Clean
 }
 
+# Helpers for WordPress core checksum comparison.
+_wp_sha256_file() {
+  local f="$1" out=""
+  if command -v sha256sum >/dev/null 2>&1; then
+    out="$(sha256sum -b -- "$f" 2>/dev/null | awk '{print $1}')"
+  elif command -v shasum >/dev/null 2>&1; then
+    out="$(shasum -a 256 -- "$f" 2>/dev/null | awk '{print $1}')"
+  elif command -v openssl >/dev/null 2>&1; then
+    out="$(openssl dgst -sha256 -r -- "$f" 2>/dev/null | awk '{print $1}')"
+  fi
+  printf '%s' "${out}"
+}
+
+_wp_trim() {
+  local s="$1"
+  s="${s#"${s%%[![:space:]]*}"}"
+  s="${s%"${s##*[![:space:]]}"}"
+  printf '%s' "$s"
+}
+
+_wp_normalize_rel_path() {
+  local rel
+  rel="$(_wp_trim "$1")"
+  while [[ "$rel" == ./* ]]; do rel="${rel#./}"; done
+  while [[ "$rel" == /* ]]; do rel="${rel#/}"; done
+  while [[ "$rel" == */ ]]; do rel="${rel%/}"; done
+  printf '%s' "$rel"
+}
+
+_wp_build_ignore_paths() {
+  local dest="$1" raw="${2:-}"
+  declare -n out="$dest"
+  local -A seen=()
+  local line base
+
+  out=()
+  for base in wp-content/uploads wp-content/plugins wp-content/themes; do
+    seen["$base"]=1
+    out+=("$base")
+  done
+
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    line="$(_wp_trim "$line")"
+    [[ -z "$line" || "$line" == \#* ]] && continue
+    base="$(_wp_normalize_rel_path "$line")"
+    [[ -z "$base" || "$base" == "." ]] && continue
+    [[ -n "${seen[$base]+x}" ]] && continue
+    seen["$base"]=1
+    out+=("$base")
+  done <<< "$raw"
+}
+
+_wp_build_unexpected_sha256_map() {
+  local dest="$1" raw="${2:-}"
+  declare -n out="$dest"
+  local line k v
+
+  out=()
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    line="$(_wp_trim "$line")"
+    [[ -z "$line" || "$line" == \#* ]] && continue
+
+    k="${line%%:*}"
+    v="${line#*:}"
+    k="$(_wp_normalize_rel_path "$k")"
+    v="$(_wp_trim "$v")"
+    [[ -z "$k" || -z "$v" ]] && continue
+    out["$k"]="$v"
+  done <<< "$raw"
+}
+
+_wp_expected_list_contains_path() {
+  local base="$1" json_file_list="$2"
+  awk -v base="$base" '
+    $0 == base || index($0, base "/") == 1 { found = 1; exit }
+    END { exit found ? 0 : 1 }
+  ' "$json_file_list"
+}
+
+_wp_find_local_checksum_files() {
+  local web_root="$1" output_file="$2" json_file_list="$3"
+  local -a find_args=(".")
+  local -a prune_paths=()
+  local base first=1
+
+  if declare -p WP_CHECKSUM_IGNORE_PATHS &>/dev/null; then
+    for base in "${WP_CHECKSUM_IGNORE_PATHS[@]}"; do
+      [[ -z "$base" || "$base" == "." ]] && continue
+      if _wp_expected_list_contains_path "$base" "$json_file_list"; then
+        continue
+      fi
+      prune_paths+=("./$base")
+    done
+  fi
+
+  if ((${#prune_paths[@]})); then
+    find_args+=( \( )
+    for base in "${prune_paths[@]}"; do
+      if (( first )); then
+        first=0
+      else
+        find_args+=( -o )
+      fi
+      find_args+=( -path "$base" -o -path "$base/*" )
+    done
+    find_args+=( \) -prune -o )
+  fi
+
+  find_args+=(
+    -type f
+    ! -path "./wp-content/languages/*.mo"
+    ! -path "./wp-content/languages/*.po"
+    ! -path "./wp-content/languages/*.json"
+    -printf "%P\n"
+  )
+
+  ( cd "$web_root" && set -o pipefail && find "${find_args[@]}" | LC_ALL=C sort -u >"$output_file" )
+}
+
 # Should a local file (relative) be ignored as an "extra"?
 _wp_ignore_extra() {
   local rel="$1"
 
-  # ---------- helpers ----------
-  _sha256_file() {
-    # echo the sha256 of "$1" or empty if failed
-    local f="$1" out=""
-    if command -v sha256sum >/dev/null 2>&1; then
-      out="$(sha256sum -b -- "$f" 2>/dev/null | awk '{print $1}')"
-    elif command -v shasum >/dev/null 2>&1; then
-      out="$(shasum -a 256 -- "$f" 2>/dev/null | awk '{print $1}')"
-    elif command -v openssl >/dev/null 2>&1; then
-      # openssl outputs "SHA256(filename)= <hash>" or "<hash> *filename" depending on flags
-      out="$(openssl dgst -sha256 -r -- "$f" 2>/dev/null | awk '{print $1}')"
-    fi
-    printf '%s' "${out}"
-  }
-
-  # ---------- build IGNORE_PATHS from WORDPRESS_CHECKSUMS_IGNORE_PATH ----------
-  local -a IGNORE_PATHS=()
-  if declare -p WORDPRESS_CHECKSUMS_IGNORE_PATH &>/dev/null; then
-    if [[ "$(declare -p WORDPRESS_CHECKSUMS_IGNORE_PATH 2>/dev/null)" == "declare -a"* ]]; then
-      IGNORE_PATHS=("${WORDPRESS_CHECKSUMS_IGNORE_PATH[@]}")
-    else
-      while IFS= read -r line; do
-        line="${line#"${line%%[![:space:]]*}"}"
-        line="${line%"${line##*[![:space:]]}"}"
-        [[ -z "$line" || "$line" == \#* ]] && continue
-        IGNORE_PATHS+=("$line")
-      done <<< "${WORDPRESS_CHECKSUMS_IGNORE_PATH}"
-    fi
+  # ---------- quick exits for well-known writable content ----------
+  local base
+  if declare -p WP_CHECKSUM_IGNORE_PATHS &>/dev/null; then
+    for base in "${WP_CHECKSUM_IGNORE_PATHS[@]}"; do
+      [[ -z "$base" ]] && continue
+      case "$rel" in
+        "$base"|"$base"/*) return 0 ;;
+      esac
+    done
   fi
 
-  # ---------- quick exits for well-known writable content ----------
   case "$rel" in
-    wp-content/uploads/*)        return 0 ;;
-    wp-content/plugins/*)        return 0 ;;
-    wp-content/themes/*)         return 0 ;;
     wp-content/languages/*.mo)   return 0 ;;
     wp-content/languages/*.po)   return 0 ;;
     wp-content/languages/*.json) return 0 ;;
@@ -139,79 +235,30 @@ _wp_ignore_extra() {
       ;;
   esac
 
-  # ---------- dangerous extension check ----------
-  local is_dangerous=0
-  case "$rel" in
-    *.php|*.phtml|*.phps|*.php[0-9]|*.phar|*.cgi|*.pl|*.sh) is_dangerous=1 ;;
-  esac
-
-  # ---------- inside configured ignore paths? ----------
-  if ((${#IGNORE_PATHS[@]})); then
-    local base
-    for base in "${IGNORE_PATHS[@]}"; do
-      [[ -z "$base" ]] && continue
-      case "$rel" in
-        "$base"|"$base"/*)
-          if (( is_dangerous )); then
-            if _is_suspicious "${SITE_WEB_ROOT_PATH}/${rel}"; then
-              return 1
-            else
-              echo -e "$(midgard_current_time) ${site}      ${c_yellow}SCANNED${c_reset} ${c_light_blue}${rel}${c_reset} ${c_green}appears OK${c_reset}"
-              echo "$(midgard_current_time)       Scanned ${rel} and appears OK" >> "${SITE_LOG_FILE}"
-              return 0
-            fi
-          else
-            return 0   # silently ignore non-executable inside ignore paths
-          fi
-          ;;
-      esac
-    done
-  fi
-
   # ---------- EXPECTED "unexpected" files with fixed SHA256 ----------
   # WORDPRESS_CHECKSUMS_UNEXPECTED_FILES is multi-line "path:sha256"
   # Example:
   # .htaccess:2e8e50...
   # wp-config.php:82b585...
   # wp-content/advanced-cache.php:beed07...
-  if [[ -n "${WORDPRESS_CHECKSUMS_UNEXPECTED_FILES:-}" ]]; then
-    local kv line k v
-    while IFS= read -r line; do
-      # trim and skip blanks/comments
-      line="${line#"${line%%[![:space:]]*}"}"
-      line="${line%"${line##*[![:space:]]}"}"
-      [[ -z "$line" || "$line" == \#* ]] && continue
-
-      # split "path:hash" — only first ':' splits the key
-      k="${line%%:*}"
-      v="${line#*:}"
-
-      # trim again in case of spaces
-      k="${k#"${k%%[![:space:]]*}"}"; k="${k%"${k##*[![:space:]]}"}"
-      v="${v#"${v%%[![:space:]]*}"}"; v="${v%"${v##*[![:space:]]}"}"
-
-      if [[ "$rel" == "$k" ]]; then
-        # If listed, verify SHA256
-        local file_abs="${SITE_WEB_ROOT_PATH}/${rel}"
-        if [[ -f "$file_abs" ]]; then
-          local have
-          have="$(_sha256_file "$file_abs")"
-          if [[ -n "$have" && -n "$v" && "$have" == "$v" ]]; then
-            echo -e "$(midgard_current_time) ${site}      ${c_cyan}VERIFIED${c_reset} ${c_light_blue}${rel}${c_reset} sha256=${c_green}${have:0:12}…${c_reset}"
-            echo "$(midgard_current_time)       Verified ${rel} sha256=$have" >> "${SITE_LOG_FILE}"
-            return 0   # accept + ignore
-          else
-            # mismatch or could not compute — do NOT ignore
-            echo -e "$(midgard_current_time) ${site}      ${c_red}DIGEST MISMATCH${c_reset} ${c_light_blue}${rel}${c_reset} expected=${v:0:12}… got=${have:0:12}…"
-            echo "$(midgard_current_time)       Digest mismatch for ${rel} expected=${v} got=${have}" >> "${SITE_LOG_FILE}"
-            return 1
-          fi
-        else
-          # listed but file missing — still unexpected; let caller handle
-          return 1
-        fi
+  if declare -p WP_CHECKSUM_UNEXPECTED_SHA256 &>/dev/null && [[ -n "${WP_CHECKSUM_UNEXPECTED_SHA256[$rel]+x}" ]]; then
+    local v="${WP_CHECKSUM_UNEXPECTED_SHA256[$rel]}"
+    local file_abs="${SITE_WEB_ROOT_PATH}/${rel}"
+    if [[ -f "$file_abs" ]]; then
+      local have
+      have="$(_wp_sha256_file "$file_abs")"
+      if [[ -n "$have" && -n "$v" && "$have" == "$v" ]]; then
+        echo -e "$(midgard_current_time) ${site}      ${c_cyan}VERIFIED${c_reset} ${c_light_blue}${rel}${c_reset} sha256=${c_green}${have:0:12}...${c_reset}"
+        echo "$(midgard_current_time)       Verified ${rel} sha256=$have" >> "${SITE_LOG_FILE}"
+        return 0
+      else
+        echo -e "$(midgard_current_time) ${site}      ${c_red}DIGEST MISMATCH${c_reset} ${c_light_blue}${rel}${c_reset} expected=${v:0:12}... got=${have:0:12}..."
+        echo "$(midgard_current_time)       Digest mismatch for ${rel} expected=${v} got=${have}" >> "${SITE_LOG_FILE}"
+        return 1
       fi
-    done <<< "${WORDPRESS_CHECKSUMS_UNEXPECTED_FILES}"
+    else
+      return 1
+    fi
   fi
 
   # Default: do NOT ignore (caller will treat as unexpected/extra)
@@ -270,6 +317,8 @@ wordpress_checksums_main() {
   local WORDPRESS_CHECKSUMS_IGNORE_PATH="$(midgard_get_value_from_array "$assoc_name" WORDPRESS_CHECKSUMS_IGNORE_PATH)"
   local WORDPRESS_CHECKSUMS_UNEXPECTED_FILES="$(midgard_get_value_from_array "$assoc_name" WORDPRESS_CHECKSUMS_UNEXPECTED_FILES)"
   local WORDPRESS_CHECKSUMS_ALLOWED_MISSING="$(midgard_get_value_from_array "$assoc_name" WORDPRESS_CHECKSUMS_ALLOWED_MISSING)"
+  local -a WP_CHECKSUM_IGNORE_PATHS=()
+  local -A WP_CHECKSUM_UNEXPECTED_SHA256=()
 
   echo -en "$(midgard_current_time) ${site}"
   echo -en "  Wordpress checksums... "
@@ -287,6 +336,8 @@ wordpress_checksums_main() {
   SITE_SYNC_PATH="$(midgard_get_value_from_array "$assoc_name" LOCAL_SYNC_PATH)"
   SITE_DOCUMENT_ROOT_PATH="$(midgard_get_value_from_array "$assoc_name" LOCAL_DOCUMENT_ROOT)"
   SITE_WEB_ROOT_PATH="${SITE_SYNC_PATH}${SITE_DOCUMENT_ROOT_PATH}"
+  _wp_build_ignore_paths WP_CHECKSUM_IGNORE_PATHS "$WORDPRESS_CHECKSUMS_IGNORE_PATH"
+  _wp_build_unexpected_sha256_map WP_CHECKSUM_UNEXPECTED_SHA256 "$WORDPRESS_CHECKSUMS_UNEXPECTED_FILES"
 
   local checksum_fail=0
 
@@ -327,7 +378,7 @@ wordpress_checksums_main() {
         rm -f "$json_file_list"
         checksum_fail=1
       else
-        if ! ( cd "$SITE_WEB_ROOT_PATH" && find . -type f -printf '%P\n' | LC_ALL=C sort -u >"$local_file_list" ); then
+        if ! _wp_find_local_checksum_files "$SITE_WEB_ROOT_PATH" "$local_file_list" "$json_file_list"; then
           echo -e "$(midgard_current_time) ${site}      ${c_light_red}FAILED${c_reset} to enumerate local files"
           echo "$(midgard_current_time) ${site}      FAILED to enumerate local files"  >> "${SITE_LOG_FILE}"
           rm -f "$json_file_list" "$local_file_list"

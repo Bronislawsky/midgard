@@ -105,6 +105,9 @@ source "$(dirname "$0")/scripts/theme-checksums"
 # wordpress checkums
 source "$(dirname "$0")/scripts/wordpress-checksums"
 
+# fix expected-file hashes in wordpress checksum allowlists
+source "$(dirname "$0")/scripts/fix-file-hash"
+
 # local archive
 source "$(dirname "$0")/scripts/local-archive"
 
@@ -134,6 +137,21 @@ case "${1-}" in
   inspect-site)
     shift
     inspect_site_main "$@"
+    exit $?
+    ;;
+  --fix-htaccess-hash)
+    declare -gA CONFIG_SITES=()
+    fix_htaccess_hash_main
+    exit $?
+    ;;
+  --fix-user-ini|--fix-user-ini-hash)
+    declare -gA CONFIG_SITES=()
+    fix_user_ini_hash_main
+    exit $?
+    ;;
+  --fix-php-ini|--fix-php-ini-hash)
+    declare -gA CONFIG_SITES=()
+    fix_php_ini_hash_main
     exit $?
     ;;
   aws-policy)

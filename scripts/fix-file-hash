@@ -1,0 +1,270 @@
+#!/usr/bin/env bash
+# file : ./scripts/fix-file-hash
+#------------------------------------------------------------------------------
+# Refresh expected-file sha256 entries in WORDPRESS_CHECKSUMS_UNEXPECTED_FILES
+# for sites currently linked in sites-enabled.
+#------------------------------------------------------------------------------
+
+[[ "${MIDGARD_MAIN:-}" == "1" ]] || {
+  echo "This script must be sourced from the midgard launcher." >&2
+  return 1 2>/dev/null || exit 1
+}
+
+_fix_checksum_sha256_file() {
+  local f="$1" out=""
+  if command -v sha256sum >/dev/null 2>&1; then
+    out="$(sha256sum -b -- "$f" 2>/dev/null | awk '{print $1}')"
+  elif command -v shasum >/dev/null 2>&1; then
+    out="$(shasum -a 256 -- "$f" 2>/dev/null | awk '{print $1}')"
+  elif command -v openssl >/dev/null 2>&1; then
+    out="$(openssl dgst -sha256 -r -- "$f" 2>/dev/null | awk '{print $1}')"
+  fi
+  printf '%s' "$out"
+}
+
+_fix_checksum_trim() {
+  local s="$1"
+  s="${s#"${s%%[![:space:]]*}"}"
+  s="${s%"${s##*[![:space:]]}"}"
+  printf '%s' "$s"
+}
+
+_fix_checksum_ini_unquote() {
+  local s
+  s="$(_fix_checksum_trim "$1")"
+  s="${s%%;*}"
+  s="${s%%#*}"
+  s="$(_fix_checksum_trim "$s")"
+  if [[ "${#s}" -ge 2 ]]; then
+    case "$s" in
+      \"*\") s="${s:1:${#s}-2}" ;;
+      \'*\') s="${s:1:${#s}-2}" ;;
+    esac
+  fi
+  _fix_checksum_trim "$s"
+}
+
+_fix_checksum_ini_looks_clean() {
+  local file="$1" rel="$2"
+  local suspicious_re
+
+  [[ -r "$file" ]] || return 1
+
+  suspicious_re='(<\?(php|=)?|base64_decode|eval[[:space:]]*\(|gzinflate|str_rot13|shell_exec|passthru|proc_open|popen|system[[:space:]]*\(|exec[[:space:]]*\(|assert[[:space:]]*\(|preg_replace[[:space:]]*\([^)]*/e|FilesMan|c99shell|r57shell|WebShell|WScript\.Shell|/bin/(sh|bash)|cmd\.exe|php://|data://|expect://|phar://|curl_exec|fsockopen)'
+  if LC_ALL=C grep -n -Ei "$suspicious_re" "$file" >/dev/null 2>&1; then
+    echo -e "$(midgard_current_time) ${site}    ${c_light_red}FAILED${c_reset} suspicious content in ${c_light_blue}${rel}${c_reset}"
+    LC_ALL=C grep -n -Ei "$suspicious_re" "$file" >&2 || true
+    return 1
+  fi
+
+  local line line_no=0 trimmed key value lower_key failed=0
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    line_no=$((line_no + 1))
+    trimmed="$(_fix_checksum_trim "$line")"
+    [[ -z "$trimmed" || "$trimmed" == \;* || "$trimmed" == \#* ]] && continue
+    [[ "$trimmed" == *"="* ]] || continue
+
+    key="$(_fix_checksum_trim "${trimmed%%=*}")"
+    lower_key="${key,,}"
+    value="$(_fix_checksum_ini_unquote "${trimmed#*=}")"
+
+    case "$lower_key" in
+      auto_prepend_file)
+        case "${value,,}" in
+          ""|"none"|"0") ;;
+          */wordfence-waf.php|wordfence-waf.php) ;;
+          *)
+            echo -e "$(midgard_current_time) ${site}      ${c_light_red}SUSPICIOUS${c_reset} ${rel}:${line_no} active auto_prepend_file=${value}"
+            failed=1
+            ;;
+        esac
+        ;;
+      auto_append_file)
+        case "${value,,}" in
+          ""|"none"|"0") ;;
+          *)
+            echo -e "$(midgard_current_time) ${site}      ${c_light_red}SUSPICIOUS${c_reset} ${rel}:${line_no} active auto_append_file=${value}"
+            failed=1
+            ;;
+        esac
+        ;;
+      extension|zend_extension)
+        case "${value,,}" in
+          *http://*|*https://*|*php://*|*data://*|*expect://*|*phar://*|*/tmp/*|*.php*|*'`'*|*'$('*|*'|'*)
+            echo -e "$(midgard_current_time) ${site}      ${c_light_red}SUSPICIOUS${c_reset} ${rel}:${line_no} ${key}=${value}"
+            failed=1
+            ;;
+        esac
+        ;;
+    esac
+  done < "$file"
+
+  [[ "$failed" -eq 0 ]]
+}
+
+_fix_checksum_write_conf_hash() {
+  local conf_file="$1" rel="$2" hash="$3"
+  local tmp_file
+  tmp_file="$(mktemp "${conf_file}.tmp.XXXXXX")" || return 1
+
+  awk -v rel="$rel" -v hash="$hash" '
+    BEGIN {
+      in_block = 0
+      seen_var = 0
+      block_has_target = 0
+      changed = 0
+    }
+
+    function is_target_line(line, key) {
+      key = line
+      sub(/:.*/, "", key)
+      sub(/^[[:space:]]+/, "", key)
+      sub(/[[:space:]]+$/, "", key)
+      return key == rel
+    }
+
+    function print_target() {
+      print rel ":" hash
+      block_has_target = 1
+      changed = 1
+    }
+
+    /^[[:space:]]*WORDPRESS_CHECKSUMS_UNEXPECTED_FILES=/ {
+      seen_var = 1
+      in_block = 1
+      block_has_target = 0
+
+      if ($0 ~ /^[[:space:]]*WORDPRESS_CHECKSUMS_UNEXPECTED_FILES="[[:space:]]*"$/) {
+        print "WORDPRESS_CHECKSUMS_UNEXPECTED_FILES=\""
+        print_target()
+        print "\""
+        in_block = 0
+        next
+      }
+
+      print
+      next
+    }
+
+    in_block {
+      if ($0 == "\"") {
+        if (!block_has_target) {
+          print_target()
+        }
+        print
+        in_block = 0
+        next
+      }
+
+      if (is_target_line($0)) {
+        print_target()
+        next
+      }
+
+      print
+      next
+    }
+
+    { print }
+
+    END {
+      if (!seen_var) {
+        print ""
+        print "WORDPRESS_CHECKSUMS_UNEXPECTED_FILES=\""
+        print rel ":" hash
+        print "\""
+      }
+    }
+  ' "$conf_file" > "$tmp_file" || {
+    rm -f "$tmp_file"
+    return 1
+  }
+
+  mv "$tmp_file" "$conf_file"
+}
+
+_fix_checksum_file_hash_main() {
+  local rel="$1" scan_mode="$2" arr_prefix="$3"
+  local root_dir enabled_dir enabled_file conf_file site arr web_root target_file hash wordpress_checksums
+  local total=0 updated_count=0 skipped_count=0 failed_count=0
+
+  root_dir="${MIDGARD_ROOT_DIR:-$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)}"
+  enabled_dir="${root_dir}/sites-enabled"
+
+  shopt -s nullglob
+  for enabled_file in "${enabled_dir}"/*.conf; do
+    [[ -L "$enabled_file" ]] || continue
+    conf_file="$(readlink -f -- "$enabled_file")"
+    [[ -f "$conf_file" ]] || continue
+
+    site="$(basename "$enabled_file" .conf)"
+    [[ "$site" == "example.com" ]] && continue
+    total=$((total + 1))
+
+    echo -e "$(midgard_current_time) ${site}  Fix ${rel} hash..."
+
+    arr="${arr_prefix}_${site//[^A-Za-z0-9_]/_}"
+    declare -gA "$arr"
+    if ! site_load_into "$site" "$arr"; then
+      echo -e "$(midgard_current_time) ${site}    ${c_light_red}FAILED${c_reset} to load site config"
+      failed_count=$((failed_count + 1))
+      continue
+    fi
+    CONFIG_SITES["$site"]="$arr"
+
+    wordpress_checksums="$(midgard_get_value_from_array "$arr" WORDPRESS_CHECKSUMS)"
+    if [[ "$wordpress_checksums" != "y" ]]; then
+      echo -e "$(midgard_current_time) ${site}    ${c_yellow}SKIPPED${c_reset} WORDPRESS_CHECKSUMS is not enabled"
+      skipped_count=$((skipped_count + 1))
+      continue
+    fi
+
+    web_root="$(midgard_get_value_from_array "$arr" LOCAL_SYNC_PATH)$(midgard_get_value_from_array "$arr" LOCAL_DOCUMENT_ROOT)"
+    target_file="${web_root}/${rel}"
+
+    if [[ ! -f "$target_file" ]]; then
+      echo -e "$(midgard_current_time) ${site}    ${c_yellow}SKIPPED${c_reset} ${rel} not found"
+      skipped_count=$((skipped_count + 1))
+      continue
+    fi
+
+    if [[ "$scan_mode" == "ini" ]] && ! _fix_checksum_ini_looks_clean "$target_file" "$rel"; then
+      echo -e "$(midgard_current_time) ${site}    ${c_light_red}FAILED${c_reset} ${rel} did not pass safety scan"
+      failed_count=$((failed_count + 1))
+      continue
+    fi
+
+    hash="$(_fix_checksum_sha256_file "$target_file")"
+    if [[ ! "$hash" =~ ^[0-9a-fA-F]{64}$ ]]; then
+      echo -e "$(midgard_current_time) ${site}    ${c_light_red}FAILED${c_reset} could not compute ${rel} sha256"
+      failed_count=$((failed_count + 1))
+      continue
+    fi
+
+    if ! _fix_checksum_write_conf_hash "$conf_file" "$rel" "$hash"; then
+      echo -e "$(midgard_current_time) ${site}    ${c_light_red}FAILED${c_reset} could not update ${conf_file}"
+      failed_count=$((failed_count + 1))
+      continue
+    fi
+
+    echo -e "$(midgard_current_time) ${site}    ${c_light_green}UPDATED${c_reset} ${rel} sha256=${hash}"
+    updated_count=$((updated_count + 1))
+  done
+  shopt -u nullglob
+
+  echo
+  echo "Fix ${rel} hash summary: total=${total} updated=${updated_count} skipped=${skipped_count} failed=${failed_count}"
+  [[ "$failed_count" -eq 0 ]]
+}
+
+fix_htaccess_hash_main() {
+  _fix_checksum_file_hash_main ".htaccess" "none" "FIX_HTACCESS"
+}
+
+fix_user_ini_hash_main() {
+  _fix_checksum_file_hash_main ".user.ini" "ini" "FIX_USER_INI"
+}
+
+fix_php_ini_hash_main() {
+  _fix_checksum_file_hash_main "php.ini" "ini" "FIX_PHP_INI"
+}

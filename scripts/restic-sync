@@ -12,8 +12,9 @@
 # restic-sync — back up LOCAL_SYNC_PATH to S3 with retention
 #   - requires MIDGARD_MAIN=1 + global config loaded (RESTIC_BIN, retries)
 #   - expects CONFIG_SITES map already populated
-#   - writes RESTIC=OK|FAIL|N/A into MIDGARD_SESSION_REPORT_DIR/<site>.report
+#   - writes RESTIC=OK|FAIL|SKIPPED into MIDGARD_SESSION_REPORT_DIR/<site>.report
 #------------------------------------------------------------------------------
+
 [[ "${MIDGARD_MAIN:-}" == "1" ]] || {
   echo "This script must be sourced from the midgard launcher." >&2
   return 1 2>/dev/null || exit 1
@@ -28,11 +29,43 @@ __restic_build_repo_url() {
   printf 's3:%s/%s/%s' "$host" "$bucket" "$prefix"
 }
 
+# Run restic with a clean per-site environment to prevent cross-site leakage
+__restic_run() {
+  # args: <log_file> <aws_key> <aws_secret> <aws_region> <repo> <pw_file_or_empty> <cmd...>
+  local log_file="$1"; shift
+  local aws_key="$1"; shift
+  local aws_secret="$1"; shift
+  local aws_region="$1"; shift
+  local repo="$1"; shift
+  local pw_file="$1"; shift
+
+  # Use per-command env; do NOT export globally (prevents bleed across sites).
+  if [[ -n "$pw_file" ]]; then
+    AWS_ACCESS_KEY_ID="$aws_key" \
+    AWS_SECRET_ACCESS_KEY="$aws_secret" \
+    AWS_DEFAULT_REGION="$aws_region" \
+    AWS_REGION="$aws_region" \
+    RESTIC_REPOSITORY="$repo" \
+    RESTIC_PASSWORD_FILE="$pw_file" \
+      "$@" >> "$log_file" 2>&1
+  else
+    # If you ever decide to use RESTIC_PASSWORD env instead of a file, wire it here.
+    # For now we require a password file (or RESTIC_PASSWORD already set by caller).
+    AWS_ACCESS_KEY_ID="$aws_key" \
+    AWS_SECRET_ACCESS_KEY="$aws_secret" \
+    AWS_DEFAULT_REGION="$aws_region" \
+    AWS_REGION="$aws_region" \
+    RESTIC_REPOSITORY="$repo" \
+      "$@" >> "$log_file" 2>&1
+  fi
+}
+
 restic_sync_main() {
   local site="$1"
 
   mkdir -p "${MIDGARD_SESSION_LOG_DIR}" "${MIDGARD_SESSION_REPORT_DIR}"
-  local SITE_LOG_FILE suggesting SITE_REPORT_FILE
+
+  local SITE_LOG_FILE SITE_REPORT_FILE
   SITE_LOG_FILE="${MIDGARD_SESSION_LOG_DIR}/${site}.log"
   SITE_REPORT_FILE="${MIDGARD_SESSION_REPORT_DIR}/${site}.report"
 
@@ -54,7 +87,7 @@ restic_sync_main() {
     return 1
   fi
 
-  # fetch fields
+  # fetch fields (local to function; avoids accidental reuse)
   local LOCAL_SYNC_PATH RESTIC_RETENTION_DAYS
   local AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_S3_BUCKET AWS_DEFAULT_REGION AWS_S3_PATH
 
@@ -74,6 +107,7 @@ restic_sync_main() {
   [[ -n "$AWS_SECRET_ACCESS_KEY" ]] || errors+=("AWS_SECRET_ACCESS_KEY")
   [[ -n "$AWS_S3_BUCKET" ]] || errors+=("AWS_S3_BUCKET")
   [[ -n "$AWS_S3_PATH" ]] || errors+=("AWS_S3_PATH")
+  [[ -n "$AWS_DEFAULT_REGION" ]] || errors+=("AWS_DEFAULT_REGION")
 
   if (( ${#errors[@]} )); then
     for err in "${errors[@]}"; do
@@ -86,13 +120,13 @@ restic_sync_main() {
     return 1
   fi
 
-  # path checks (keep semantics aligned with report renderer: OK/FAIL/N/A)
+  # path checks
   if [[ ! -d "$LOCAL_SYNC_PATH" ]]; then
-    echo -e "$(midgard_current_time) ${site}   LOCAL_SYNC_PATH missing -> mark N/A: ${c_yellow}${LOCAL_SYNC_PATH}${c_reset}"
-    echo "$(midgard_current_time) ${site}   LOCAL_SYNC_PATH missing -> mark N/A: ${LOCAL_SYNC_PATH}" >> "$SITE_LOG_FILE"
-    echo -e "$(midgard_current_time) ${site} Restic Backup Sync ${c_light_blue}[${c_yellow}N/A${c_light_blue}]${c_reset}"
-    echo "$(midgard_current_time) Restic Backup Sync [N/A]" >> "$SITE_LOG_FILE"
-    echo "RESTIC=N/A" >> "$SITE_REPORT_FILE"
+    echo -e "$(midgard_current_time) ${site}   LOCAL_SYNC_PATH missing -> mark SKIPPED: ${c_yellow}${LOCAL_SYNC_PATH}${c_reset}"
+    echo "$(midgard_current_time) ${site}   LOCAL_SYNC_PATH missing -> mark SKIPPED: ${LOCAL_SYNC_PATH}" >> "$SITE_LOG_FILE"
+    echo -e "$(midgard_current_time) ${site} Restic Backup Sync ${c_light_blue}[${c_yellow}SKIPPED${c_light_blue}]${c_reset}"
+    echo "$(midgard_current_time) Restic Backup Sync [SKIPPED]" >> "$SITE_LOG_FILE"
+    echo "RESTIC=SKIPPED" >> "$SITE_REPORT_FILE"
     return 0
   fi
 
@@ -105,7 +139,7 @@ restic_sync_main() {
 
   # repo url
   local repo
-  repo="$(__restic_build_repo_url "${AWS_DEFAULT_REGION:-}" "$AWS_S3_BUCKET" "$AWS_S3_PATH")"
+  repo="$(__restic_build_repo_url "$AWS_DEFAULT_REGION" "$AWS_S3_BUCKET" "$AWS_S3_PATH")"
   if [[ -z "$repo" ]]; then
     echo "$(midgard_current_time) ${site}   Unable to construct repository URL" >> "$SITE_LOG_FILE"
     echo -e "$(midgard_current_time) ${site} Restic Backup Sync ${c_light_blue}[${c_light_red}FAILED${c_light_blue}]${c_reset}"
@@ -114,7 +148,7 @@ restic_sync_main() {
     return 1
   fi
 
-  # password file logic (same as your old script)
+  # password file logic
   local script_dir root_dir data_dir restic_password_file
   script_dir="$(cd -- "$(dirname "${BASH_SOURCE[0]}")" &>/dev/null; pwd -P)"
   root_dir="$(cd -- "${script_dir}/.." &>/dev/null; pwd -P)"
@@ -129,15 +163,7 @@ restic_sync_main() {
     return 1
   fi
 
-  # reset any leaked env + export for restic
-  unset RESTIC_REPOSITORY RESTIC_PASSWORD_FILE
-  unset AWS_DEFAULT_REGION
-  export AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY
-  [[ -n "${AWS_DEFAULT_REGION:-}" ]] && export AWS_DEFAULT_REGION
-  export RESTIC_REPOSITORY="$repo"
-  [[ -z "${RESTIC_PASSWORD:-}" ]] && export RESTIC_PASSWORD_FILE="$restic_password_file"
-
-  echo "$(midgard_current_time) ${site}   Repository: $RESTIC_REPOSITORY" >> "$SITE_LOG_FILE"
+  echo "$(midgard_current_time) ${site}   Repository: $repo" >> "$SITE_LOG_FILE"
   echo "$(midgard_current_time) ${site}   Backing up: $LOCAL_SYNC_PATH" >> "$SITE_LOG_FILE"
   echo "$(midgard_current_time) ${site}   Retention: keep-within ${keep_days}d" >> "$SITE_LOG_FILE"
 
@@ -145,17 +171,29 @@ restic_sync_main() {
   local backoff="${DEFAULT_RETRY_BACKOFF_SECS:-5}"
   local n rc=0
 
-  # probe/init (snapshots; init if needed)
+  # Decide password method for __restic_run:
+  # If RESTIC_PASSWORD is set by caller, we rely on it (no pw file passed).
+  # Otherwise pass the password file explicitly.
+  local pw_file=""
+  if [[ -z "${RESTIC_PASSWORD:-}" ]]; then
+    pw_file="$restic_password_file"
+  fi
+
+  # probe snapshots
   rc=0
   for ((n=1; n<=tries; n++)); do
-    "${RESTIC_BIN}" snapshots >> "$SITE_LOG_FILE" 2>&1 && { rc=0; break; } || rc=$?
+    __restic_run "$SITE_LOG_FILE" "$AWS_ACCESS_KEY_ID" "$AWS_SECRET_ACCESS_KEY" "$AWS_DEFAULT_REGION" "$repo" "$pw_file" \
+      "${RESTIC_BIN}" snapshots && { rc=0; break; } || rc=$?
     (( n < tries )) && { echo "retry snapshots $n/${tries} in ${backoff}s (rc=$rc)" >> "$SITE_LOG_FILE"; sleep "$backoff"; }
   done
+
+  # init if needed
   if (( rc != 0 )); then
     echo "$(midgard_current_time) ${site}   Repository not initialized; running restic init" >> "$SITE_LOG_FILE"
     rc=0
     for ((n=1; n<=tries; n++)); do
-      "${RESTIC_BIN}" init >> "$SITE_LOG_FILE" 2>&1 && { rc=0; break; } || rc=$?
+      __restic_run "$SITE_LOG_FILE" "$AWS_ACCESS_KEY_ID" "$AWS_SECRET_ACCESS_KEY" "$AWS_DEFAULT_REGION" "$repo" "$pw_file" \
+        "${RESTIC_BIN}" init && { rc=0; break; } || rc=$?
       (( n < tries )) && { echo "retry init $n/${tries} in ${backoff}s (rc=$rc)" >> "$SITE_LOG_FILE"; sleep "$backoff"; }
     done
     if (( rc != 0 )); then
@@ -169,11 +207,12 @@ restic_sync_main() {
   # backup
   rc=0
   for ((n=1; n<=tries; n++)); do
-    "${RESTIC_BIN}" backup \
-      --one-file-system \
-      --host "${RUN_AS_HOST}" \
-      --tag "midgard" --tag "$site" \
-      "$LOCAL_SYNC_PATH" >> "$SITE_LOG_FILE" 2>&1 && { rc=0; break; } || rc=$?
+    __restic_run "$SITE_LOG_FILE" "$AWS_ACCESS_KEY_ID" "$AWS_SECRET_ACCESS_KEY" "$AWS_DEFAULT_REGION" "$repo" "$pw_file" \
+      "${RESTIC_BIN}" backup \
+        --one-file-system \
+        --host "${RUN_AS_HOST}" \
+        --tag "midgard" --tag "$site" \
+        "$LOCAL_SYNC_PATH" && { rc=0; break; } || rc=$?
     (( n < tries )) && { echo "retry backup $n/${tries} in ${backoff}s (rc=$rc)" >> "$SITE_LOG_FILE"; sleep "$backoff"; }
   done
   if (( rc != 0 )); then
@@ -186,7 +225,8 @@ restic_sync_main() {
   # retention prune
   rc=0
   for ((n=1; n<=tries; n++)); do
-    "${RESTIC_BIN}" forget --keep-within "${keep_days}d" --prune >> "$SITE_LOG_FILE" 2>&1 && { rc=0; break; } || rc=$?
+    __restic_run "$SITE_LOG_FILE" "$AWS_ACCESS_KEY_ID" "$AWS_SECRET_ACCESS_KEY" "$AWS_DEFAULT_REGION" "$repo" "$pw_file" \
+      "${RESTIC_BIN}" forget --keep-within "${keep_days}d" --prune && { rc=0; break; } || rc=$?
     (( n < tries )) && { echo "retry prune $n/${tries} in ${backoff}s (rc=$rc)" >> "$SITE_LOG_FILE"; sleep "$backoff"; }
   done
   if (( rc != 0 )); then

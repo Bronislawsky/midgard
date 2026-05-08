@@ -238,7 +238,9 @@ send_global_report() {
   local epoch="${1:-${EPOCH_TIMESTAMP:-}}"
   [[ -n "$epoch" ]] || { echo "send_global_report: missing epoch"; return 1; }
 
-  local rep_dir="reports/${epoch}"
+  local log_dir="${MIDGARD_ROOT_DIR}/logs/${EPOCH_TIMESTAMP}"
+  local rep_dir="${MIDGARD_ROOT_DIR}/reports/${EPOCH_TIMESTAMP}"
+
   local out_pdf="${rep_dir}/global.pdf"
   local out_html="${rep_dir}/global.html"
 

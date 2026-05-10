@@ -123,8 +123,65 @@ source "$(dirname "$0")/scripts/report-global"
 # Per site mail sending helper
 source "$(dirname "$0")/scripts/sendmail-site"
 
+midgard_show_help() {
+  cat <<'EOF'
+Usage: ./midgard [command]
+
+Commands:
+  --help
+      Show this help message
+
+  encstr
+      Encrypt a string
+
+  decstr
+      Decrypt a string
+
+  create-site
+      Create a new site configuration
+
+  inspect-site <site>
+      Inspect one site configuration and secrets
+
+  restic <site>
+      Open the restic menu for a site
+      [1] list remote backup
+      [2] Restore backup
+
+  site list
+      List all available sites and whether they are enabled
+
+  site enable <site|all>
+      Enable one site or all sites
+
+  site disable <site|all>
+      Disable one site or all sites
+
+  aws-policy
+      Show or manage AWS policy helper output
+
+  --fix-htaccess-hash
+      Update expected .htaccess hashes
+
+  --fix-user-ini
+  --fix-user-ini-hash
+      Update expected .user.ini hashes
+
+  --fix-php-ini
+  --fix-php-ini-hash
+      Update expected php.ini hashes
+
+No command:
+  Run the full enabled-site workflow:
+  rsync, sql pull, restic backup, scans, archive, and reports
+EOF
+}
+
 # fast-path subcommands that don't need global config
 case "${1-}" in
+  --help|-h|help)
+    midgard_show_help
+    exit 0 ;;
   encstr)
     midgard_encstr; exit 0 ;;
   decstr)
@@ -158,6 +215,24 @@ case "${1-}" in
     shift
     source "$(dirname "$0")/scripts/aws-policy"
     aws_policy_cmd "$@"
+    exit $? ;;
+  restic)
+    shift
+    site="${1-}"
+    if [[ -z "${site:-}" ]]; then
+      echo "Usage: ./midgard restic <site>"
+      exit 1
+    fi
+
+    inspect_site_main "$site" "skip-encrypt" || exit $?
+
+    declare -gA CONFIG_SITES=()
+    arr="SITE_${site//[^A-Za-z0-9_]/_}"
+    declare -gA "$arr"
+    site_load_into "$site" "$arr" || exit $?
+    CONFIG_SITES["$site"]="$arr"
+
+    restic_menu_main "$site"
     exit $? ;;
   site)
     shift

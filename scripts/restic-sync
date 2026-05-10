@@ -60,6 +60,204 @@ __restic_run() {
   fi
 }
 
+__restic_run_stdout() {
+  # args: <aws_key> <aws_secret> <aws_region> <repo> <pw_file_or_empty> <cmd...>
+  local aws_key="$1"; shift
+  local aws_secret="$1"; shift
+  local aws_region="$1"; shift
+  local repo="$1"; shift
+  local pw_file="$1"; shift
+
+  if [[ -n "$pw_file" ]]; then
+    AWS_ACCESS_KEY_ID="$aws_key" \
+    AWS_SECRET_ACCESS_KEY="$aws_secret" \
+    AWS_DEFAULT_REGION="$aws_region" \
+    AWS_REGION="$aws_region" \
+    RESTIC_REPOSITORY="$repo" \
+    RESTIC_PASSWORD_FILE="$pw_file" \
+      "$@"
+  else
+    AWS_ACCESS_KEY_ID="$aws_key" \
+    AWS_SECRET_ACCESS_KEY="$aws_secret" \
+    AWS_DEFAULT_REGION="$aws_region" \
+    AWS_REGION="$aws_region" \
+    RESTIC_REPOSITORY="$repo" \
+      "$@"
+  fi
+}
+
+restic_list_snapshots_main() {
+  local site="$1"
+  local assoc_name="${CONFIG_SITES[$site]:-}"
+  if [[ -z "$assoc_name" ]]; then
+    echo "restic_list_snapshots_main: site not loaded: $site" >&2
+    return 1
+  fi
+
+  local AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_S3_BUCKET AWS_DEFAULT_REGION AWS_S3_PATH
+  AWS_ACCESS_KEY_ID="$(midgard_get_value_from_array "$assoc_name" AWS_ACCESS_KEY_ID)"
+  AWS_SECRET_ACCESS_KEY="$(midgard_get_value_from_array "$assoc_name" AWS_SECRET_ACCESS_KEY)"
+  AWS_S3_BUCKET="$(midgard_get_value_from_array "$assoc_name" AWS_S3_BUCKET)"
+  AWS_DEFAULT_REGION="$(midgard_get_value_from_array "$assoc_name" AWS_DEFAULT_REGION)"
+  AWS_S3_PATH="$(midgard_get_value_from_array "$assoc_name" AWS_S3_PATH)"
+
+  local errors=()
+  [[ -x "${RESTIC_BIN:-}" ]] || errors+=("RESTIC_BIN")
+  [[ -n "$AWS_ACCESS_KEY_ID" ]] || errors+=("AWS_ACCESS_KEY_ID")
+  [[ -n "$AWS_SECRET_ACCESS_KEY" ]] || errors+=("AWS_SECRET_ACCESS_KEY")
+  [[ -n "$AWS_S3_BUCKET" ]] || errors+=("AWS_S3_BUCKET")
+  [[ -n "$AWS_S3_PATH" ]] || errors+=("AWS_S3_PATH")
+  [[ -n "$AWS_DEFAULT_REGION" ]] || errors+=("AWS_DEFAULT_REGION")
+  if (( ${#errors[@]} )); then
+    printf 'Please verify: %s\n' "${errors[*]}" >&2
+    return 1
+  fi
+
+  local repo
+  repo="$(__restic_build_repo_url "$AWS_DEFAULT_REGION" "$AWS_S3_BUCKET" "$AWS_S3_PATH")"
+  if [[ -z "$repo" ]]; then
+    echo "restic_list_snapshots_main: unable to construct repository URL" >&2
+    return 1
+  fi
+
+  local script_dir root_dir data_dir restic_password_file pw_file
+  script_dir="$(cd -- "$(dirname "${BASH_SOURCE[0]}")" &>/dev/null; pwd -P)"
+  root_dir="$(cd -- "${script_dir}/.." &>/dev/null; pwd -P)"
+  data_dir="${SITES_DATA_DIR:-${root_dir}/sites-data}"
+  restic_password_file="${RESTIC_PASSWORD_FILE:-${data_dir}/${site}/restic.pass}"
+  pw_file=""
+  if [[ -z "${RESTIC_PASSWORD:-}" ]]; then
+    if [[ ! -r "$restic_password_file" ]]; then
+      echo "restic_list_snapshots_main: missing readable ${data_dir}/${site}/restic.pass" >&2
+      return 1
+    fi
+    pw_file="$restic_password_file"
+  fi
+
+  echo
+  echo "Remote restic snapshots for ${site}"
+  echo "Repository: ${repo}"
+  echo
+
+  __restic_run_stdout \
+    "$AWS_ACCESS_KEY_ID" \
+    "$AWS_SECRET_ACCESS_KEY" \
+    "$AWS_DEFAULT_REGION" \
+    "$repo" \
+    "$pw_file" \
+    "${RESTIC_BIN}" snapshots
+}
+
+restic_restore_snapshot_main() {
+  local site="$1"
+  local assoc_name="${CONFIG_SITES[$site]:-}"
+  if [[ -z "$assoc_name" ]]; then
+    echo "restic_restore_snapshot_main: site not loaded: $site" >&2
+    return 1
+  fi
+
+  local AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_S3_BUCKET AWS_DEFAULT_REGION AWS_S3_PATH
+  AWS_ACCESS_KEY_ID="$(midgard_get_value_from_array "$assoc_name" AWS_ACCESS_KEY_ID)"
+  AWS_SECRET_ACCESS_KEY="$(midgard_get_value_from_array "$assoc_name" AWS_SECRET_ACCESS_KEY)"
+  AWS_S3_BUCKET="$(midgard_get_value_from_array "$assoc_name" AWS_S3_BUCKET)"
+  AWS_DEFAULT_REGION="$(midgard_get_value_from_array "$assoc_name" AWS_DEFAULT_REGION)"
+  AWS_S3_PATH="$(midgard_get_value_from_array "$assoc_name" AWS_S3_PATH)"
+
+  local errors=()
+  [[ -x "${RESTIC_BIN:-}" ]] || errors+=("RESTIC_BIN")
+  [[ -n "$AWS_ACCESS_KEY_ID" ]] || errors+=("AWS_ACCESS_KEY_ID")
+  [[ -n "$AWS_SECRET_ACCESS_KEY" ]] || errors+=("AWS_SECRET_ACCESS_KEY")
+  [[ -n "$AWS_S3_BUCKET" ]] || errors+=("AWS_S3_BUCKET")
+  [[ -n "$AWS_S3_PATH" ]] || errors+=("AWS_S3_PATH")
+  [[ -n "$AWS_DEFAULT_REGION" ]] || errors+=("AWS_DEFAULT_REGION")
+  if (( ${#errors[@]} )); then
+    printf 'Please verify: %s\n' "${errors[*]}" >&2
+    return 1
+  fi
+
+  local repo
+  repo="$(__restic_build_repo_url "$AWS_DEFAULT_REGION" "$AWS_S3_BUCKET" "$AWS_S3_PATH")"
+  if [[ -z "$repo" ]]; then
+    echo "restic_restore_snapshot_main: unable to construct repository URL" >&2
+    return 1
+  fi
+
+  local script_dir root_dir data_dir restic_password_file pw_file
+  script_dir="$(cd -- "$(dirname "${BASH_SOURCE[0]}")" &>/dev/null; pwd -P)"
+  root_dir="$(cd -- "${script_dir}/.." &>/dev/null; pwd -P)"
+  data_dir="${SITES_DATA_DIR:-${root_dir}/sites-data}"
+  restic_password_file="${RESTIC_PASSWORD_FILE:-${data_dir}/${site}/restic.pass}"
+  pw_file=""
+  if [[ -z "${RESTIC_PASSWORD:-}" ]]; then
+    if [[ ! -r "$restic_password_file" ]]; then
+      echo "restic_restore_snapshot_main: missing readable ${data_dir}/${site}/restic.pass" >&2
+      return 1
+    fi
+    pw_file="$restic_password_file"
+  fi
+
+  local snapshot_id=""
+  printf "ID: "
+  read -r snapshot_id || return 1
+  if [[ -z "$snapshot_id" ]]; then
+    echo "Snapshot ID is required"
+    return 1
+  fi
+
+  local default_target="${HOME}/RESTIC_RESTORE/${site}/${snapshot_id}"
+  local restore_target=""
+  printf "Restore to [%s]: " "$default_target"
+  read -r restore_target || return 1
+  if [[ -z "$restore_target" ]]; then
+    restore_target="$default_target"
+  fi
+
+  mkdir -p "$restore_target"
+
+  echo
+  echo "Restoring snapshot ${snapshot_id} for ${site}"
+  echo "Target: ${restore_target}"
+  echo
+
+  __restic_run_stdout \
+    "$AWS_ACCESS_KEY_ID" \
+    "$AWS_SECRET_ACCESS_KEY" \
+    "$AWS_DEFAULT_REGION" \
+    "$repo" \
+    "$pw_file" \
+    "${RESTIC_BIN}" restore "$snapshot_id" --target "$restore_target"
+}
+
+restic_menu_main() {
+  local site="$1"
+  local choice=""
+
+  while true; do
+    echo
+    echo "Restic menu for ${site}"
+    echo "[1] list remote backup"
+    echo "[2] Restore backup"
+    echo "[q] Quit"
+    printf "> "
+    read -r choice || return 0
+
+    case "$choice" in
+      1)
+        restic_list_snapshots_main "$site"
+        ;;
+      2)
+        restic_restore_snapshot_main "$site"
+        ;;
+      q|Q)
+        return 0
+        ;;
+      *)
+        echo "Invalid choice"
+        ;;
+    esac
+  done
+}
+
 restic_sync_main() {
   local site="$1"
 

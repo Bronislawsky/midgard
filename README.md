@@ -104,7 +104,7 @@ sudo ninja install
 echo "/usr/local/lib" | sudo tee /etc/ld.so.conf.d/local.conf
 sudo ldconfig
 ldconfig -p | grep -i vector
-# soemthing like that
+# something like that
 
 
 
@@ -119,7 +119,8 @@ pip3 install wordfence
 pip3 install weasyprint
 
 # Install Maldet
-curl -LO https://www.rfxn.com/downloads/maldetect-current.tar.gz
-tar xvfz maldetect-current.tar.gz
-cd maldetect-#.#.#
-./install.sh
+git clone https://github.com/rfxn/linux-malware-detect.git
+cd linux-malware-detect
+sudo ./install.sh
+sudo maldet -u # for updating 
+sudo maldet -d # for updating
